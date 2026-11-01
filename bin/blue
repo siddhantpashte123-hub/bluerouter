@@ -1041,6 +1041,124 @@ async function cmdCheck(flags, positional) {
   printCheckRows(results);
 }
 
+/**
+ * `blue quota` — how much headroom is really left, and whether several keys
+ * share one provider quota (Groq: limits are per organisation, so extra keys
+ * inside the same account add nothing).
+ */
+async function cmdQuota(flags, positional) {
+  const store = openStore(flags);
+  if (!store.keys().length) die(`No accounts yet. Add one first: ${c.bold('blue add groq <API_KEY>')}`);
+
+  const targetId = positional[1] && positional[1] !== 'all' ? positional[1] : null;
+  const model = flags.model || '';
+  const up = await serverUp(store);
+
+  let rows;
+  let pools;
+  if (up) {
+    const res = await api(store, 'POST', '/admin/quota', { ...(model ? { model } : {}), ...(targetId ? { accountId: targetId } : {}) })
+      .catch((e) => die(e.message));
+    rows = res.data.rows;
+    pools = res.data.pools;
+  } else {
+    const { probeQuota, analysePools } = require('../src/quota');
+    const { getProvider } = require('../src/providers');
+    const cfg = store.get();
+    const accounts = store.keys().filter((a) => (targetId ? a.id === targetId : true));
+    rows = [];
+    for (const account of accounts) {
+      const provider = getProvider(account.provider, cfg);
+      if (!provider) {
+        rows.push({ id: account.id, name: account.name, provider: account.provider, ok: false, status: 'error', detail: 'Provider not configured' });
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const r = await probeQuota(provider, account, { model: model || undefined });
+      rows.push({ id: account.id, name: account.name, provider: account.provider, ...r });
+    }
+    pools = analysePools(rows);
+  }
+
+  if (flags.json) {
+    out(JSON.stringify({ rows, pools }, null, 2));
+    return;
+  }
+
+  heading('Quota probe');
+  out(`  ${c.gray('One 1-token request per account — this costs a little of your daily quota.')}`);
+  blank();
+
+  const pct = (left, limit) => {
+    if (left == null || !limit) return c.gray('—');
+    const p = Math.max(0, Math.min(100, Math.round((left / limit) * 100)));
+    const color = p > 50 ? c.green : p > 15 ? c.yellow : c.red;
+    return `${color(`${p}%`)} ${c.gray(`${humanNumber(left)}/${humanNumber(limit)}`)}`;
+  };
+  const tableRows = rows.map((r) => {
+    const lim = r.limits || { requests: {}, tokens: {} };
+    const state = r.ok ? c.green('ok') : r.status === 'rate-limited' ? c.yellow('limited') : c.red(r.status || 'error');
+    return [
+      c.gray(r.id),
+      r.name,
+      r.provider,
+      state,
+      pct(lim.requests.remaining, lim.requests.limit),
+      pct(lim.tokens.remaining, lim.tokens.limit),
+      lim.requests.resetMs != null ? humanDuration(lim.requests.resetMs) : c.gray('—'),
+      r.detail ? c.gray(String(r.detail).slice(0, 30)) : '',
+    ];
+  });
+  table(['ID', 'NAME', 'PROVIDER', 'STATE', 'REQUESTS LEFT', 'TOKENS LEFT', 'RESET', 'NOTE'], tableRows);
+
+  const noHeaders = rows.filter((r) => r.ok && (!r.limits || !r.limits.present));
+  if (noHeaders.length) {
+    out(`  ${c.gray('Some providers do not send rate-limit headers — "REQUESTS LEFT" shows — for those.')}`);
+  }
+
+  blank();
+  if (!pools.length) {
+    info('No rate-limit counters were reported by the providers, so pool sharing cannot be checked.');
+    return;
+  }
+
+  const sharedGroups = pools.filter((p) => p.shared);
+  const separateGroups = pools.filter((p) => !p.shared && p.accounts > 1);
+
+  for (const p of pools) {
+    const label = `${p.provider} · ${p.model}`;
+    if (!p.shared && p.accounts === 1) {
+      kv(label, `${c.gray('1 account')} ${c.green('→ 1 pool')}`);
+    } else if (p.shared) {
+      kv(label, `${c.yellow(`${p.accounts} accounts → 1 shared pool`)} ${c.gray('(keys add no extra capacity)')}`);
+    } else {
+      kv(label, `${c.green(`${p.accounts} accounts → ${p.pools} separate pools`)} ${c.gray('(capacity really multiplies)')}`);
+    }
+  }
+  blank();
+
+  if (sharedGroups.length) {
+    warn('These keys share ONE quota pool.');
+    out(`  ${c.gray('The provider counts usage per organization, not per key - every key in the same')}`);
+    out(`  ${c.gray('account draws from the same daily budget. Rotation still helps nothing there.')}`);
+    blank();
+    out(`  ${c.gray('What actually adds capacity:')}`);
+    out(`  ${c.gray('•')} accounts from a ${c.bold('different')} provider: ${c.bold('blue add cerebras <key>')}, ${c.bold('blue add openrouter <key>')}, …`);
+    out(`  ${c.gray('•')} a provider paid/developer tier (limits are ~10x, no minimum spend)`);
+    out(`  ${c.gray('•')} a model with a bigger daily allowance: ${c.bold('llama-3.1-8b-instant')} has far more TPD than the 70B`);
+    blank();
+  }
+  if (sharedGroups.length && separateGroups.length === 0 && pools.every((p) => p.shared)) {
+    out(`  ${c.gray('Note: creating extra accounts purely to get around limits is against most')}`);
+    out(`  ${c.gray("providers' terms (Groq's policy forbids it) and risks losing all of them.")}`);
+    blank();
+  }
+  if (separateGroups.length) {
+    info('Separate pools detected — those accounts really do multiply your daily capacity.');
+    blank();
+  }
+}
+
 function printCheckRows(rows) {
   const data = rows.map((k) => {
     const r = k.check || {};
@@ -1449,6 +1567,7 @@ function printHelp() {
       ['enable / disable <id>', 'take an account in or out of rotation'],
       ['rename <id> <name>', 'label an account (e.g. "groq-2")'],
       ['check [id|all]', 'call the provider to verify keys'],
+      ['quota [--model m]', 'real rate-limit headroom + shared-pool check'],
       ['reset', 'clear all cooldowns'],
       ['url / token / rotate', 'show URLs, API key, rotate client key'],
     ],
@@ -1535,6 +1654,9 @@ async function main() {
     case 'check':
     case 'health':
       return cmdCheck(flags, positional);
+    case 'quota':
+    case 'limits':
+      return cmdQuota(flags, positional);
     case 'reset':
     case 'clear-cooldowns':
       return cmdReset(flags);

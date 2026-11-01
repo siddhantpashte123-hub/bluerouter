@@ -51,6 +51,8 @@ async function check(name, fn) {
   }
 }
 
+let clock = 1;
+
 function mockServer() {
   return http.createServer((req, res) => {
     const chunks = [];
@@ -63,6 +65,13 @@ function mockServer() {
         return res.end(JSON.stringify({ data: [{ id: 'test-model' }, { id: 'other-model' }] }));
       }
       if (req.url === '/v1/chat/completions') {
+        // Groq-style quota headers so `blue quota` has something to read
+        res.setHeader('x-ratelimit-limit-requests', '1000');
+        res.setHeader('x-ratelimit-remaining-requests', String(1000 - clock++));
+        res.setHeader('x-ratelimit-limit-tokens', '12000');
+        res.setHeader('x-ratelimit-remaining-tokens', '9000');
+        res.setHeader('x-ratelimit-reset-requests', '1m');
+        res.setHeader('x-ratelimit-reset-tokens', '5s');
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({
           id: 'x',
@@ -300,7 +309,27 @@ function mockServer() {
       assert.strictEqual(good.status, 200);
     });
 
-    await check('reset clears cooldowns', async () => {
+    await check('quota reports headroom and pool sharing as JSON', async () => {
+    const r = await run(['quota', '--json']);
+    assert.strictEqual(r.code, 0, r.out);
+    const json = JSON.parse(r.stdout);
+    assert.ok(Array.isArray(json.rows), 'rows missing');
+    assert.ok(json.rows.length >= 2, 'expected a row per account');
+    assert.ok(Array.isArray(json.pools), 'pools missing');
+    const first = json.rows[0];
+    assert.strictEqual(first.ok, true, first.detail);
+    assert.ok(first.limits, 'limits missing');
+    assert.strictEqual(typeof first.limits.requests.remaining, 'number');
+  });
+
+  await check('quota --model targets a specific model', async () => {
+    const r = await run(['quota', '--model', 'llama-3.1-8b-instant', '--json']);
+    assert.strictEqual(r.code, 0, r.out);
+    const json = JSON.parse(r.stdout);
+    assert.strictEqual(json.rows[0].model, 'llama-3.1-8b-instant');
+  });
+
+  await check('reset clears cooldowns', async () => {
       const r = await run(['reset']);
       assert.strictEqual(r.code, 0, r.out);
       assert.match(r.out, /cooldowns cleared/i);

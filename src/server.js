@@ -15,6 +15,7 @@ const path = require('path');
 const os = require('os');
 const { Store } = require('./store');
 const { proxyRequest, listModels, send } = require('./proxy');
+const { probeQuota, analysePools } = require('./quota');
 const {
   getProvider,
   allProviders,
@@ -426,6 +427,30 @@ async function handleAdmin({ req, res, store, p, url, startedAt }) {
       results.push({ id: account.id, name: account.name, provider: account.provider, ...(await checkAccount(store, account)) });
     }
     return send(res, 200, { data: results });
+  }
+
+  /* ------------------------------ quota ---------------------------- */
+  if (p === '/admin/quota' && method === 'POST') {
+    const body = await json();
+    const rows = [];
+    const accounts = store.keys().filter((a) => (body.accountId ? a.id === body.accountId : true));
+    if (!accounts.length) {
+      return send(res, 400, { error: { message: 'No accounts to probe.', type: 'invalid_request_error' } });
+    }
+    // Sequential on purpose: a shared pool is only visible when the counters
+    // are read one after another (see src/quota.js).
+    for (const account of accounts) {
+      const provider = getProvider(account.provider, cfg);
+      if (!provider) {
+        rows.push({ id: account.id, name: account.name, provider: account.provider, ok: false, status: 'error', detail: 'Provider not configured' });
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const result = await probeQuota(provider, account, { model: body.model });
+      rows.push({ id: account.id, name: account.name, provider: account.provider, ...result });
+    }
+    const pools = analysePools(rows);
+    return send(res, 200, { data: { rows, pools } });
   }
 
   /* ------------------------------ config --------------------------- */

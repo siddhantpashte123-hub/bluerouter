@@ -57,6 +57,9 @@ function sse(res, chunks) {
   res.end();
 }
 
+const sharedQuota = { remaining: 1000 };
+const soloQuota = new Map();
+
 function mockServer() {
   return http.createServer((req, res) => {
     const key = String(req.headers.authorization || req.headers['x-api-key'] || '').replace(/^Bearer\s+/i, '');
@@ -118,6 +121,19 @@ function mockServer() {
 
       /* --- OpenAI protocol --- */
       if (req.url === '/v1/chat/completions') {
+        // rate-limit headers: "shared-*" keys share one pool, others are solo
+        if (/^(shared|solo)-/.test(String(key || ''))) {
+          const isShared = String(key).startsWith('shared');
+          if (isShared) sharedQuota.remaining -= 1;
+          else soloQuota.set(key, (soloQuota.get(key) == null ? 1000 : soloQuota.get(key)) - 1);
+          const remaining = isShared ? sharedQuota.remaining : soloQuota.get(key);
+          res.setHeader('x-ratelimit-limit-requests', '1000');
+          res.setHeader('x-ratelimit-remaining-requests', String(remaining));
+          res.setHeader('x-ratelimit-limit-tokens', '12000');
+          res.setHeader('x-ratelimit-remaining-tokens', String(remaining * 10));
+          res.setHeader('x-ratelimit-reset-requests', '2m30s');
+          res.setHeader('x-ratelimit-reset-tokens', '7.5s');
+        }
         if (body.stream) {
           return sse(res, [
             { id: 'chatcmpl-1', object: 'chat.completion.chunk', model: body.model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
@@ -200,6 +216,8 @@ async function call(pathname, { method = 'GET', body, key = clientKey, headers =
     mock500: { ...providerDefaults(), baseUrl: mockUrl },
     mockfail: { ...providerDefaults(), baseUrl: mockUrl },
     mockauth: { ...providerDefaults(), baseUrl: mockUrl },
+    mockquota: { ...providerDefaults(), baseUrl: mockUrl },
+    mockquota2: { ...providerDefaults(), baseUrl: mockUrl },
     anthropic: { ...providerDefaults(), baseUrl: mockUrl, protocol: 'anthropic', authStyle: 'x-api-key', models: ['claude-test'] },
   });
   cfg.routing.maxRetries = 3;
@@ -223,6 +241,13 @@ async function call(pathname, { method = 'GET', body, key = clientKey, headers =
   store.addKey({ provider: 'mockfail', key: 'bad-429', name: 'only-broken', priority: 10 });
   store.addKey({ provider: 'mockauth', key: 'bad-auth', name: 'expired', priority: 10 });
   store.addKey({ provider: 'mockauth', key: 'good-a', name: 'auth-good' });
+
+  // same organisation: two keys, one shared quota pool
+  store.addKey({ provider: 'mockquota', key: 'shared-1', name: 'groq-acct-1' });
+  store.addKey({ provider: 'mockquota', key: 'shared-2', name: 'groq-acct-2' });
+  // separate organisations: keys with independent pools
+  store.addKey({ provider: 'mockquota2', key: 'solo-1', name: 'other-acct-1' });
+  store.addKey({ provider: 'mockquota2', key: 'solo-2', name: 'other-acct-2' });
   store.addKey({ provider: 'anthropic', key: 'ant-key', name: 'claude-1' });
   store.save();
 
@@ -251,10 +276,10 @@ async function call(pathname, { method = 'GET', body, key = clientKey, headers =
     assert.deepStrictEqual(p2.models, ['z']);
   });
 
-  await check('health endpoint is public and reports 9 accounts', async () => {
+  await check('health endpoint is public and reports 13 accounts', async () => {
     const r = await call('/health', { key: '' });
     assert.strictEqual(r.status, 200);
-    assert.strictEqual(r.json.accounts, 9);
+    assert.strictEqual(r.json.accounts, store.keys().length);
   });
 
   await check('wrong client key is rejected with 401', async () => {
@@ -417,6 +442,47 @@ async function call(pathname, { method = 'GET', body, key = clientKey, headers =
     assert.strictEqual(r.status, 200);
     assert.ok(r.json.data.totals.requests > 5);
     assert.ok(r.json.data.totals.tokensIn >= 13);
+  });
+
+  await check('quota probe reads rate-limit headers from the provider', async () => {
+    await call('/admin/cooldowns/clear', { method: 'POST', key: adminToken });
+    const r = await call('/admin/quota', { method: 'POST', key: adminToken, body: {} });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json).slice(0, 300));
+    const row = r.json.data.rows.find((x) => x.name === 'groq-acct-1');
+    assert.ok(row, 'probe row missing');
+    assert.strictEqual(row.ok, true, row.detail);
+    assert.strictEqual(row.status, 'ok');
+    assert.strictEqual(row.limits.requests.limit, 1000);
+    assert.strictEqual(typeof row.limits.requests.remaining, 'number');
+    assert.strictEqual(row.limits.requests.resetMs, 150000);
+    assert.strictEqual(row.limits.tokens.resetMs, 7500);
+  });
+
+  await check('quota probe detects keys that share one organisation quota', async () => {
+    const r = await call('/admin/quota', { method: 'POST', key: adminToken, body: {} });
+    assert.strictEqual(r.status, 200);
+    const shared = r.json.data.pools.find((p) => p.provider === 'mockquota');
+    assert.ok(shared, 'no pool for the shared provider');
+    assert.strictEqual(shared.accounts, 2);
+    assert.strictEqual(shared.shared, true, 'shared pool not detected');
+    assert.strictEqual(shared.pools, 1);
+  });
+
+  await check('quota probe treats separate keys as separate pools', async () => {
+    const r = await call('/admin/quota', { method: 'POST', key: adminToken, body: {} });
+    const solo = r.json.data.pools.find((p) => p.provider === 'mockquota2');
+    assert.ok(solo, 'no pool for the separate provider');
+    assert.strictEqual(solo.shared, false, 'separate pools flagged as shared');
+    assert.strictEqual(solo.pools, 2);
+  });
+
+  await check('quota probe survives a provider that exposes no limits', async () => {
+    const r = await call('/admin/quota', { method: 'POST', key: adminToken, body: { accountId: 'nope' } });
+    assert.strictEqual(r.status, 400);
+    const r2 = await call('/admin/quota', { method: 'POST', key: adminToken, body: {} });
+    const row = r2.json.data.rows.find((x) => x.provider === 'mockauth');
+    assert.ok(row, 'mockauth row missing (no rate-limit headers there)');
+    assert.strictEqual(row.limits.present, false);
   });
 
   await check('forwarded headers produce public URLs (Codespaces / proxies)', async () => {

@@ -16,7 +16,7 @@ const DEFAULT_PROVIDERS = {
     authStyle: 'bearer',
     keyHint: 'starts with gsk_',
     models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b'],
-    quota: { requestsPerMinute: '~30 RPM / key', tokensPerDay: '~200K–1M TPD / key (model wise)', note: 'Groq free tier limits are per model per account' },
+    quota: { requestsPerMinute: '~30 RPM / org', tokensPerDay: '~100K–500K TPD / org (model wise)', note: 'Free tier counts per ORGANIZATION, per model — extra keys in one account add nothing' },
     docs: 'https://console.groq.com/docs/rate-limits',
     audio: true,
   },

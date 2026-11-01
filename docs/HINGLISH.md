@@ -60,6 +60,40 @@ blue status
 
 Output me `running` dikhna chahiye.
 
+### 5 keys = 5× quota? Nahi — pehle ye padho
+
+Groq ki limits **per organization** hain, **per key nahi**. Ek hi Groq account
+me 5 keys banane se quota 5× nahi hota — sab ek hi daily budget se khate hain.
+
+Sach check karne ke liye:
+
+```bash
+blue quota
+```
+
+```
+groq · llama-3.1-8b-instant   2 accounts → 1 shared pool (keys add no extra capacity)
+groq2 · llama-3.1-8b-instant  2 accounts → 2 separate pools (capacity really multiplies)
+```
+
+Ye kaise pata chalta hai? Ek-ek key par chhota request jaata hai aur response ke
+`x-ratelimit-remaining-requests` header compare hote hain. Same organization me
+counter har request par 1 girta hai; alag organizations me apna-apna counter
+rehta hai.
+
+**Asli capacity badhane ke legit tarike:**
+
+| Tarika | Fayda |
+| --- | --- |
+| **Alag providers** — `blue add cerebras <key>`, `blue add openrouter <key>`, `blue add gemini <key>` … | har provider alag pool = asli 2×, 3×, 4× |
+| Groq **Developer tier** (card add, no minimum spend) | ~10× limits |
+| Bada daily allowance wala model (`llama-3.1-8b-instant` ≫ `llama-3.3-70b-versatile`) | zyada requests, same tokens |
+| Prompt caching (jahan support ho) | cached tokens limit me nahi ginte |
+
+Sirf quota badhane ke liye naye Groq accounts banana Groq ki Acceptable Use
+policy ke against hai — pakde jaane par saare accounts ja sakte hain. Alag
+**providers** ko pool karna is design ka legit version hai.
+
 ### Codespace / Docker / WSL me systemd nahi hota
 
 Agar aap **GitHub Codespace, Docker, WSL ya kisi LXC** me ho, wahan systemd

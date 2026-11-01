@@ -59,6 +59,45 @@ That is it. Your gateway is live on `http://<vps-ip>:1212`.
 > Open the port in your VPS firewall: `ufw allow 1212/tcp` (and in your
 > provider's firewall panel if you have one).
 
+### Read this before you add 5 keys: how free quotas actually work
+
+Most providers cap usage **per organization, not per API key**. Five keys
+created inside one Groq account share one daily budget — rotation across them
+gives you nothing to spend, only a second way to authenticate.
+
+Check what you really have:
+
+```bash
+blue quota
+```
+
+```
+ID              NAME      PROVIDER  STATE  REQUESTS LEFT   TOKENS LEFT      RESET
+acc_25884836c4  groq-1    groq      ok     99% 989/1.0K    74% 8.9K/12.0K   3m 12s
+acc_4e42e0a067  groq-2    groq      ok     99% 988/1.0K    74% 8.9K/12.0K   3m 12s
+
+groq · llama-3.1-8b-instant   2 accounts → 1 shared pool (keys add no extra capacity)
+```
+
+A shared pool is detected by probing the keys one after another: inside one
+organization the remaining counter drops by exactly one per probe, while
+independent organizations each keep their own counter.
+
+**What actually gives you more capacity**
+
+| Option | Effect |
+| --- | --- |
+| Accounts from **different providers** (`cerebras`, `cerebras`, `openrouter`, `gemini`, `nvidia`, `mistral`, `sambanova`, `together`, …) | each one is a separate pool — this is the real way to pool |
+| A provider **developer/paid tier** (Groq: card on file, no minimum spend) | ~10× the free limits |
+| A model with a **bigger daily allowance** (`llama-3.1-8b-instant` ≫ `llama-3.3-70b-versatile`) | more requests for the same tokens |
+| **Prompt caching** (where supported) | cached tokens do not count toward limits |
+
+Creating extra accounts just to get around one organization's limits is against
+Groq's Acceptable Use policy and can cost you all of the accounts. Pooling
+*separate providers* is the legitimate version of this design.
+
+BlueRouter tells you which case you are in, and rotates correctly either way.
+
 ### No systemd? (Docker, Codespaces, WSL, LXC, shared hosting)
 
 `blue install` picks the right mode by itself: **systemd** when it is available
@@ -376,8 +415,8 @@ Requires Node.js 18+. Node 22 is what CI uses.
 ```bash
 git clone https://github.com/siddhantpashte123-hub/bluerouter.git
 cd bluerouter
-npm test              # 26 end-to-end routing tests against a fake provider
-npm run test:cli      # 26 CLI tests, real binary + live server
+npm test              # 30 end-to-end routing tests against a fake provider
+npm run test:cli      # 28 CLI tests, real binary + live server
 npm run test:service  # 15 background-mode install/stop/start/uninstall tests
 npm install --no-save jsdom && npm run test:ui   # 14 dashboard tests in jsdom
 npm run demo          # fake provider + seeded dashboard on http://127.0.0.1:1212
