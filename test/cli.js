@@ -94,14 +94,21 @@ function mockServer() {
     assert.match(r.out, /blue add groq/);
   });
 
-  await check('install refuses to run without root (or without systemd)', async () => {
-    const r = await run(['install', '--port', String(PORT)]);
-    assert.notStrictEqual(r.code, 0, r.out);
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
-      assert.match(r.out, /systemd/i);
-    } else {
-      assert.match(r.out, /sudo blue install/);
-    }
+  await check('install --systemd refuses when systemd is unusable / no root', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root: nothing to refuse
+    const r = await run(['install', '--systemd', '--port', String(PORT)]);
+    assert.strictEqual(r.code, 1, r.out);
+    // either "systemd is not running" (no usable systemd) or "needs root"
+    assert.match(r.out, /systemd is not running|sudo blue install/i);
+  });
+
+  await check('install --systemd explains when systemd is missing', async () => {
+    const { systemdAvailable } = require('../src/service');
+    if (systemdAvailable()) return; // machine has systemd, nothing to check
+    const r = await run(['install', '--systemd', '--port', String(PORT)]);
+    assert.strictEqual(r.code, 1, r.out);
+    assert.match(r.out, /systemd is not running/i);
+    assert.match(r.out, /--background/);
   });
 
   await check('status works before anything is configured', async () => {
@@ -304,14 +311,23 @@ function mockServer() {
       assert.match(r.out, /not installed/i);
     });
 
-    await check('uninstall refuses without root / warns when not installed', async () => {
+    await check('stop / restart refuse politely when nothing is installed', async () => {
+      const st = JSON.parse((await run(['status', '--json'])).stdout);
+      if (st.service.installed) return; // another mode is installed here
+      const stop = await run(['stop']);
+      assert.strictEqual(stop.code, 1, stop.out);
+      assert.match(stop.out, /not installed/i);
+      const restart = await run(['restart']);
+      assert.strictEqual(restart.code, 1, restart.out);
+      assert.match(restart.out, /not installed/i);
+    });
+
+    await check('uninstall warns when nothing is installed', async () => {
+      const st = JSON.parse((await run(['status', '--json'])).stdout);
+      assert.strictEqual(st.service.installed, false);
       const r = await run(['uninstall', '--yes']);
-      if (typeof process.getuid === 'function' && process.getuid() === 0) {
-        assert.match(r.out, /not installed|Removed|removed/i);
-      } else {
-        assert.strictEqual(r.code, 1);
-        assert.match(r.out, /sudo blue uninstall/);
-      }
+      assert.strictEqual(r.code, 0, r.out);
+      assert.match(r.out, /not installed/i);
     });
   } finally {
     server.kill('SIGTERM');

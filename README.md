@@ -59,6 +59,37 @@ That is it. Your gateway is live on `http://<vps-ip>:1212`.
 > Open the port in your VPS firewall: `ufw allow 1212/tcp` (and in your
 > provider's firewall panel if you have one).
 
+### No systemd? (Docker, Codespaces, WSL, LXC, shared hosting)
+
+`blue install` picks the right mode by itself: **systemd** when it is available
+(full auto-restart + boot start), otherwise a **background process** with a PID
+file and a log file. Force it either way with `--systemd` / `--background`.
+
+```bash
+blue install --background      # no root, no systemd needed
+blue status                    # same command, shows "background process"
+blue logs -f                   # tails data/logs/bluerouter.log instead of journald
+blue stop / start / restart    # work in both modes
+sudo blue uninstall --yes      # or without sudo in background mode
+```
+
+If `/opt/bluerouter` already exists on an older branch (for example right after
+an update that has not been merged yet), the installer stops with a clear
+message instead of a confusing failure. Point it at the branch you want:
+
+```bash
+... | sudo bash -s -- --branch <branch-name>
+```
+
+Background mode does **not** restart by itself after a reboot or a crash — that
+is only what systemd gives you. Use it for testing, containers, and short-lived
+boxes; use a real VPS (or run the process under your own supervisor) for
+anything permanent.
+
+Inside GitHub Codespaces the install output also prints the forwarded public URL
+(`https://<codespace>-1212.app.github.dev`) — make the port **Public** in the
+Ports tab if you want to call it from other devices.
+
 ---
 
 ## Use it
@@ -127,7 +158,8 @@ Run `blue` with no arguments for the full list.
 
 | Command | What it does |
 | --- | --- |
-| `sudo blue install [--port 1212]` | installs the systemd service, enables boot start, starts it |
+| `sudo blue install [--port 1212]` | installs the service and starts it (systemd if available, else background) |
+| `blue install --background` | same, but never uses systemd and needs no root |
 | `sudo blue uninstall` | stops and removes the service (keeps your accounts) |
 | `sudo blue uninstall --purge --yes` | removes the service **and deletes all data** |
 | `blue status` | service state, accounts, cooldowns, traffic (`--json` for scripting) |
@@ -344,8 +376,9 @@ Requires Node.js 18+. Node 22 is what CI uses.
 ```bash
 git clone https://github.com/siddhantpashte123-hub/bluerouter.git
 cd bluerouter
-npm test              # 25 end-to-end routing tests against a fake provider
-npm run test:cli      # 24 CLI tests, real binary + live server
+npm test              # 26 end-to-end routing tests against a fake provider
+npm run test:cli      # 26 CLI tests, real binary + live server
+npm run test:service  # 15 background-mode install/stop/start/uninstall tests
 npm install --no-save jsdom && npm run test:ui   # 14 dashboard tests in jsdom
 npm run demo          # fake provider + seeded dashboard on http://127.0.0.1:1212
 PORT=1212 BLUEROUTER_DATA=./data node src/server.js
@@ -399,6 +432,9 @@ another account automatically, up to `maxRetries`.
 
 **Can I run several BlueRouters?** Yes, one per VPS. They don't talk to each
 other.
+
+**Does it work in Docker / Codespaces / WSL?** Yes — run `blue install
+--background` (or just `node src/server.js`). No systemd required.
 
 **Is there a Docker image?** Not needed — `node src/server.js` is the whole app.
 

@@ -419,6 +419,17 @@ async function call(pathname, { method = 'GET', body, key = clientKey, headers =
     assert.ok(r.json.data.totals.tokensIn >= 13);
   });
 
+  await check('forwarded headers produce public URLs (Codespaces / proxies)', async () => {
+    const r = await call('/admin/urls', {
+      key: adminToken,
+      headers: { 'x-forwarded-host': 'demo-1234-12142.app.github.dev', 'x-forwarded-proto': 'https' },
+    });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.json.data.public, 'https://demo-1234-12142.app.github.dev');
+    assert.strictEqual(r.json.data.apiBase, 'https://demo-1234-12142.app.github.dev/v1');
+    assert.match(r.json.data.dashboard, /#token=/);
+  });
+
   await check('config PATCH updates routing without exposing secrets', async () => {
     const r = await call('/admin/config', { method: 'PATCH', key: adminToken, body: { routing: { maxRetries: 4 } } });
     assert.strictEqual(r.status, 200);

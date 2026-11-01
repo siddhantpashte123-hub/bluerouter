@@ -156,7 +156,7 @@ function promptSecret(question) {
 /* Args / store / http                                                 */
 /* ------------------------------------------------------------------ */
 
-const BOOL_FLAGS = new Set(['yes', 'json', 'purge', 'errors', 'force', 'help', 'offline', 'all', 'fresh', 'no-start', 'follow', 'version', 'restart']);
+const BOOL_FLAGS = new Set(['yes', 'json', 'purge', 'errors', 'force', 'help', 'offline', 'all', 'fresh', 'no-start', 'follow', 'version', 'restart', 'systemd', 'background']);
 
 function parseArgs(argv) {
   const flags = {};
@@ -185,6 +185,15 @@ function parseArgs(argv) {
 function openStore(flags = {}) {
   const dir = flags['data-dir'] || DATA_DIR;
   return new Store({ dataDir: dir }).init();
+}
+
+/** /health of the instance that owns this data dir (null if none / someone else). */
+async function probeMine(store, port) {
+  const health = await svc.probe(port || Number(store.get().port) || 1212);
+  if (!health) return null;
+  const mine = store.get().instanceId;
+  if (mine && health.instanceId && health.instanceId !== mine) return null;
+  return health;
 }
 
 async function serverUp(store) {
@@ -252,20 +261,113 @@ async function listKeys(store, filterProvider) {
 /* Commands: lifecycle                                                 */
 /* ------------------------------------------------------------------ */
 
+/** Public URL when running inside GitHub Codespaces / a forwarded port. */
+function forwardedUrl(port) {
+  const name = process.env.CODESPACE_NAME;
+  const domain = process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN;
+  if (name && domain) return `https://${name}-${port}.${domain}`;
+  if (process.env.GITPOD_WORKSPACE_URL) {
+    const base = process.env.GITPOD_WORKSPACE_URL.replace('https://', '');
+    return `https://${port}-${base}`;
+  }
+  return null;
+}
+
+function modeLabel(mode) {
+  if (mode === 'systemd') return `systemd (${svc.UNIT_NAME})`;
+  if (mode === 'background') return 'background process (no systemd)';
+  return 'foreground (blue start)';
+}
+
+/** Start / stop / restart, whichever mode is installed. */
+function serviceStart(opts) {
+  const st = svc.statusOf(opts.dataDir);
+  if (st.mode === 'systemd') return svc.start();
+  return svc.backgroundStart(opts);
+}
+
+function serviceStop(dataDir) {
+  const st = svc.statusOf(dataDir);
+  if (st.mode === 'systemd') return svc.stop();
+  return svc.backgroundStop(dataDir);
+}
+
+/**
+ * Start background mode and wait until the process is really serving.
+ * Returns { ok, pid } or { ok: false, err, logTail }.
+ */
+async function startBackgroundVerified(store, { port, dataDir, timeoutMs = 12000 }) {
+  const started = svc.backgroundStart({
+    repoDir: ROOT,
+    dataDir,
+    nodeBin: process.execPath,
+    port,
+  });
+  if (!started.ok) return started;
+  if (started.already) return started;
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!svc.pidAlive(started.pid)) {
+      const logTail = svc.backgroundLogs(dataDir, 12);
+      svc.backgroundStop(dataDir, { quiet: true });
+      svc.removeServiceRecord(dataDir);
+      const last = logTail.split('\n').filter(Boolean).pop() || 'process exited immediately';
+      const portBusy = /EADDRINUSE/.test(logTail);
+      return {
+        ok: false,
+        logTail,
+        err: portBusy
+          ? `port ${port} is already in use (stop whatever is using it, or use: blue install --port 1213)`
+          : last,
+      };
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const health = await probeMine(store, port);
+    if (health) return { ok: true, pid: started.pid };
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  const logTail = svc.backgroundLogs(dataDir, 12);
+  svc.backgroundStop(dataDir, { quiet: true });
+  svc.removeServiceRecord(dataDir);
+  return { ok: false, logTail, err: `did not answer on port ${port} within ${Math.round(timeoutMs / 1000)}s` };
+}
+
+function serviceLogs(dataDir, n) {
+  const st = svc.statusOf(dataDir);
+  return st.mode === 'systemd' ? svc.journalLines(n) : svc.backgroundLogs(dataDir, n);
+}
+
 async function cmdInstall(flags) {
-  if (!svc.isRoot()) {
-    die(`Install needs root. Run: ${c.bold('sudo blue install')}`);
-  }
-  if (!svc.systemdAvailable()) {
-    die('systemd not found on this machine. Use another VPS or run `blue start` inside tmux/screen.');
-  }
   const major = Number(String(process.versions.node).split('.')[0]);
   if (major < 18) die(`Node.js 18+ required (found ${process.versions.node}).`);
 
   const store = openStore(flags);
   const cfg = store.get();
-  let port = Number(flags.port || cfg.port || 1212);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) die(`Invalid port: ${flags.port}`);
+  const port = Number(flags.port || cfg.port || 1212);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) die(`Invalid port: ${String(flags.port)}`);
+
+  // ---- pick a service mode -------------------------------------
+  const hasSystemd = svc.systemdAvailable();
+  let mode;
+  if (flags.systemd) mode = 'systemd';
+  else if (flags.background) mode = 'background';
+  else mode = hasSystemd ? 'systemd' : 'background';
+
+  if (mode === 'systemd') {
+    if (!hasSystemd) {
+      die(`systemd is not running on this machine, so a systemd service cannot be installed.\n  Use: ${c.bold('blue install --background')}   ${c.gray('(works in Docker, Codespaces, LXC, WSL)')}\n  Or install on a normal VPS where systemd is available.`);
+    }
+    if (!svc.isRoot()) {
+      if (flags.systemd) {
+        die(`A systemd service needs root. Run ${c.bold('sudo blue install')}\n  ${c.gray('No root? Use: blue install --background')}`);
+      }
+      warn('No root here, so systemd is not an option — using background mode.');
+      mode = 'background';
+    }
+  }
+
   if (cfg.port !== port) {
     cfg.port = port;
     store.save();
@@ -274,7 +376,7 @@ async function cmdInstall(flags) {
   if (/\s/.test(ROOT) || /\s/.test(dataDir)) {
     die(`Install paths cannot contain spaces:\n  repo: ${ROOT}\n  data: ${dataDir}\n  Move the checkout somewhere like /opt/bluerouter and try again.`);
   }
-  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
   heading('Installing BlueRouter');
   kv('Version', pkg.version);
@@ -282,8 +384,11 @@ async function cmdInstall(flags) {
   kv('Install dir', ROOT);
   kv('Data dir', dataDir);
   kv('Port', String(port));
+  kv('Mode', mode === 'systemd'
+    ? `${c.green('systemd')} ${c.gray('— auto-restart + start on boot')}`
+    : `${c.yellow('background')} ${c.gray('— no systemd here, running detached')}`);
 
-  // 1. CLI symlink -> `blue` from anywhere
+  // ---- 1. `blue` on PATH ---------------------------------------
   let symlinkNote = 'skipped';
   try {
     const target = path.join(ROOT, 'bin', 'blue');
@@ -299,27 +404,42 @@ async function cmdInstall(flags) {
         symlinkNote = link;
       }
     } else if (fs.existsSync(link)) {
-      symlinkNote = `${link} exists (not a symlink) — using sudo blue instead`;
+      symlinkNote = `${link} already exists — run it with: node ${target}`;
     } else {
       fs.symlinkSync(target, link);
       symlinkNote = `${link} → ${target}`;
     }
   } catch (err) {
-    symlinkNote = `failed (${err.message})`;
+    symlinkNote = `not linked (${err.message}) — use ./bin/blue`;
   }
 
-  // 2. systemd unit
-  svc.writeUnit({ repoDir: ROOT, dataDir, nodeBin: process.execPath, port });
-  svc.daemonReload();
-  svc.enable();
-  const started = svc.restart();
-  if (!started.ok) {
-    warn(`systemctl restart returned: ${started.err || started.out}`);
+  // ---- 2. install + start --------------------------------------
+  if (mode === 'systemd') {
+    svc.writeUnit({ repoDir: ROOT, dataDir, nodeBin: process.execPath, port });
+    svc.writeServiceRecord(dataDir, {
+      mode: 'systemd',
+      port,
+      repoDir: ROOT,
+      nodeBin: process.execPath,
+      dataDir,
+      installedAt: new Date().toISOString(),
+    });
+    svc.daemonReload();
+    svc.enable();
+    const started = svc.restart();
+    if (!started.ok) warn(`systemctl restart returned: ${started.err || started.out}`);
+  } else {
+    const started = await startBackgroundVerified(store, { port, dataDir });
+    if (!started.ok) {
+      blank();
+      die(`Could not start the background service: ${started.err}${started.logTail ? `\n\n${c.gray(started.logTail)}` : ''}`);
+    }
+    if (started.already) info('Already running — reusing the existing process.');
   }
 
-  // 3. wait for it to answer
+  // ---- 3. wait for /health -------------------------------------
   let health = null;
-  for (let i = 0; i < 24; i += 1) {
+  for (let i = 0; i < 30; i += 1) {
     // eslint-disable-next-line no-await-in-loop
     health = await svc.probe(port, 700);
     if (health) break;
@@ -328,36 +448,63 @@ async function cmdInstall(flags) {
   }
   if (!health) {
     blank();
-    warn('Service did not answer on /health yet. Last log lines:');
+    const logText = serviceLogs(dataDir, 40) || '';
+    warn('The service did not answer on /health. Last log lines:');
     blank();
-    out(svc.journalLines(25));
-    die('Install finished but the server is not responding. Check the log above (journalctl -u bluerouter -n 50).');
+    out(logText || c.gray('  (no log yet)'));
+    if (mode === 'systemd') {
+      const info = svc.failureInfo();
+      if (info) out(`  ${c.gray('systemd:')} ${info}`);
+    }
+    blank();
+    if (/EADDRINUSE|address already in use/i.test(logText)) {
+      die(`Port ${port} is already in use. Free it, or install on another port: ${c.bold(`blue install --port ${port + 1}`)}`);
+    }
+    if (/NAMESPACE|status=226/i.test(logText)) {
+      die(`systemd could not start the process (namespace/permissions).\n  Try background mode instead: ${c.bold('blue install --background')}`);
+    }
+    die(`Server is not responding.\n  Logs: ${c.bold('blue logs')}${mode === 'background' ? c.gray(`  (file: ${svc.logFile(dataDir)})`) : ''}`);
   }
 
-  // 4. final report
-  const serviceState = svc.status();
+  // ---- 4. report ------------------------------------------------
+  const state = svc.statusOf(dataDir);
   const ip = lanIp();
   const base = `http://${ip}:${port}`;
+  const forwarded = forwardedUrl(port);
 
-  heading('BlueRouter is live');
-  kv('Service', c.green(`active`) + c.gray(`  (systemd: ${svc.UNIT_NAME}, ${serviceState.enabled ? 'auto-start on boot' : 'manual start'})`));
-  kv('Dashboard', c.bold(`${base}/`));
-  kv('Admin URL', `${base}/#token=${cfg.adminToken}`);
-  kv('API base', c.bold(`${base}/v1`));
-  kv('Health', `${base}/health`);
+  heading(mode === 'systemd' ? 'BlueRouter is live' : 'BlueRouter is running');
+  kv('Service', c.green(state.active ? '● running' : '● started')
+    + c.gray(`  ${modeLabel(mode)}`)
+    + (mode === 'systemd' ? c.gray(`, ${state.enabled ? 'auto-start on boot' : 'manual start'}`) : ''));
+  if (forwarded) kv('Public URL', c.bold(forwarded) + c.gray('  (Codespaces port forward)'));
+  kv('Dashboard', c.bold(`${forwarded || base}/`));
+  kv('Admin URL', `${forwarded || base}/#token=${cfg.adminToken}`);
+  kv('API base', c.bold(`${forwarded || base}/v1`));
+  kv('Local', `${base}/v1`);
   kv('API key', c.green(cfg.clientKey));
   kv('Admin token', c.gray(cfg.adminToken));
-  kv('CLI symlink', symlinkNote);
+  kv('CLI', symlinkNote);
   kv('Data', dataDir);
+  if (mode === 'background') {
+    kv('Log file', svc.logFile(dataDir));
+    blank();
+    warn('Background mode: the process keeps running, but it does NOT restart by itself after a reboot.');
+    info(`On a real VPS use ${c.bold('sudo blue install')} (systemd) for auto-restart + boot start.`);
+  }
   blank();
   out(`  ${c.gray('Next steps')}`);
-  out(`  ${c.gray('•')} Add accounts:      ${c.bold(`blue add groq <API_KEY>`)}   ${c.gray('(ya: blue add groq k1 k2 k3)')}`);
+  out(`  ${c.gray('•')} Add accounts:      ${c.bold('blue add groq <API_KEY>')}   ${c.gray('(ya: blue add groq k1 k2 k3)')}`);
   out(`  ${c.gray('•')} Check accounts:    ${c.bold('blue check')}`);
   out(`  ${c.gray('•')} Send a test:       ${c.bold('blue test')}`);
   out(`  ${c.gray('•')} Live logs:         ${c.bold('blue logs -f')}`);
   blank();
-  out(`  ${c.gray('If the dashboard is not reachable from outside:')} ${c.bold(`ufw allow ${port}/tcp`)} ${c.gray('(and open the port in your VPS firewall panel)')}`);
-  blank();
+  if (forwarded) {
+    info('Codespaces: open the "Ports" tab and make port ' + port + ' Public (or keep the tab open) to use this URL from your apps.');
+    blank();
+  } else if (!process.env.CODESPACE_NAME) {
+    out(`  ${c.gray('Not reachable from outside?')} ${c.bold(`ufw allow ${port}/tcp`)} ${c.gray('(and open the port in your VPS firewall panel)')}`);
+    blank();
+  }
 }
 
 function isSymlink(p) {
@@ -369,15 +516,21 @@ function isSymlink(p) {
 }
 
 async function cmdUninstall(flags) {
-  if (!svc.isRoot()) die(`Uninstall needs root. Run: ${c.bold('sudo blue uninstall')}`);
-  if (!svc.unitExists()) {
+  const store = openStore(flags);
+  const dataDir = store.dir;
+  const state = svc.statusOf(dataDir);
+
+  if (!state.installed) {
     warn('BlueRouter service is not installed.');
-    if (flags.purge) await purgeData(flags, flags['data-dir'] || DATA_DIR);
+    if (flags.purge) await purgeData(flags, flags['data-dir'] || dataDir);
     return;
+  }
+  if (state.mode === 'systemd' && !svc.isRoot()) {
+    die(`Removing a systemd service needs root. Run: ${c.bold('sudo blue uninstall')}`);
   }
   if (!flags.yes) {
     if (!process.stdin.isTTY) die('Refusing to uninstall without confirmation. Re-run with --yes.');
-    const go = await ask('Stop and remove the BlueRouter service?', { def: false });
+    const go = await ask(`Stop and remove the BlueRouter service (${state.mode})?`, { def: false });
     if (!go) {
       info('Cancelled.');
       return;
@@ -385,17 +538,25 @@ async function cmdUninstall(flags) {
   }
 
   heading('Uninstalling BlueRouter');
-  const store = openStore(flags);
-  const dataDir = store.dir;
-  kv('Service', svc.UNIT_NAME);
+  kv('Service', state.mode === 'systemd' ? svc.UNIT_NAME : `background pid ${state.pid || '—'}`);
+  kv('Mode', modeLabel(state.mode));
   kv('Data (kept)', dataDir);
 
-  const stopped = svc.stop();
-  if (stopped.ok) ok('Service stopped');
-  svc.disable();
-  svc.removeUnit();
-  svc.daemonReload();
-  ok(`Removed ${svc.UNIT_PATH}`);
+  if (svc.unitExists()) {
+    const stopped = svc.stop();
+    if (stopped.ok) ok('systemd service stopped');
+    svc.disable();
+    svc.removeUnit();
+    svc.daemonReload();
+    ok(`Removed ${svc.UNIT_PATH}`);
+  }
+  if (state.mode === 'background' || svc.readRun(dataDir)) {
+    const stopped = svc.backgroundStop(dataDir);
+    if (stopped.ok) ok(stopped.stopped ? `Stopped background process ${stopped.stopped}` : 'No background process was running');
+    else warn(`Could not stop the background process: ${stopped.err}`);
+  }
+  svc.removeServiceRecord(dataDir);
+  ok(`Removed ${svc.installFile(dataDir)}`);
 
   try {
     const link = '/usr/local/bin/blue';
@@ -436,8 +597,8 @@ async function cmdStatus(flags) {
   const store = openStore(flags);
   const cfg = store.get();
   const port = Number(cfg.port) || 1212;
-  const state = svc.status();
-  const health = await svc.probe(port);
+  const state = svc.statusOf(store.dir);
+  const health = await probeMine(store, port);
 
   let stats = null;
   if (health) {
@@ -459,10 +620,16 @@ async function cmdStatus(flags) {
 
   /* service */
   const installed = state.installed;
-  const active = state.active || !!health;
-  const svcLabel = installed
-    ? (active ? c.green('● running') : c.red('● stopped')) + c.gray(`  systemd (${state.enabled ? 'enabled' : 'disabled'})`)
-    : (health ? c.yellow('● running') + c.gray('  foreground (blue start)') : c.gray('○ not installed'));
+  const active = installed ? state.active : !!health;
+  let svcLabel;
+  if (installed) {
+    const detail = state.mode === 'systemd'
+      ? `systemd (${state.enabled ? 'enabled at boot' : 'manual start'})`
+      : 'background process (no auto-start on boot)';
+    svcLabel = (active ? c.green('● running') : c.red('● stopped')) + c.gray(`  ${detail}`);
+  } else {
+    svcLabel = health ? c.yellow('● running') + c.gray('  foreground (blue start)') : c.gray('○ not installed');
+  }
   kv('Server', svcLabel);
   if (state.pid) kv('PID', String(state.pid));
   if (health) {
@@ -470,9 +637,11 @@ async function cmdStatus(flags) {
     kv('Uptime', up);
     kv('Version', health.version);
   }
+  const publicUrl = forwardedUrl(port);
   kv('Port', String(port));
-  kv('Dashboard', `http://${lanIp()}:${port}`);
-  kv('API base', `http://${lanIp()}:${port}/v1`);
+  if (publicUrl) kv('Public URL', c.bold(publicUrl));
+  kv('Dashboard', publicUrl || `http://${lanIp()}:${port}`);
+  kv('API base', `${publicUrl || `http://${lanIp()}:${port}`}/v1`);
   if (health) kv('Health', `${c.green(health.status)} ${c.gray(`(${health.accounts} accounts, ${health.providers} provider${health.providers === 1 ? '' : 's'})`)}`);
 
   /* accounts */
@@ -527,8 +696,15 @@ async function cmdStatus(flags) {
 async function cmdStart(flags) {
   const store = openStore(flags);
   const port = Number(flags.port || store.get().port) || 1212;
-  if (svc.unitExists() && svc.status().active && !flags.force) {
+  const state = svc.statusOf(store.dir);
+  if (state.installed && state.active && !flags.force) {
     die(`Service is already running. Use ${c.bold('blue restart')} or ${c.bold('blue status')}.`);
+  }
+  // A service is installed but stopped -> start it the way it was installed,
+  // instead of blocking this terminal with a foreground process.
+  if (state.installed) {
+    await cmdService('start');
+    return;
   }
   const { start, shutdown } = require('../src/server');
   const instance = await start({ port, host: store.get().host || '0.0.0.0', dataDir: store.dir });
@@ -541,34 +717,91 @@ async function cmdStart(flags) {
   process.on('SIGTERM', () => stop('SIGTERM'));
 }
 
-function cmdService(action) {
-  if (!svc.unitExists()) {
+async function cmdService(action) {
+  const store = openStore();
+  const dataDir = store.dir;
+  const state = svc.statusOf(dataDir);
+  const port = Number(store.get().port) || 1212;
+
+  if (!state.installed) {
     die(`Service not installed. Run ${c.bold('sudo blue install')} first.`);
   }
-  const map = { start: svc.start, stop: svc.stop, restart: svc.restart, enable: svc.enable, disable: svc.disable };
-  const fn = map[action];
-  const res = fn();
-  if (!res.ok && !/not running|already/i.test(res.err || '')) {
-    warn(`${action}: ${res.err || res.out}`);
+  if (state.mode === 'systemd' && !svc.isRoot() && ['start', 'stop', 'restart', 'enable', 'disable'].includes(action)) {
+    die(`systemd control needs root. Run: ${c.bold(`sudo blue ${action}`)}`);
+  }
+
+  if (state.mode === 'background' && (action === 'enable' || action === 'disable')) {
+    warn('Background mode has no boot auto-start to toggle.');
+    info(`On a VPS with systemd: ${c.bold('sudo blue install')} → then ${c.bold('sudo blue enable')}`);
     process.exitCode = 1;
     return;
   }
-  ok(`Service ${action}${action.endsWith('e') ? 'd' : 'ed'}`);
-  const st = svc.status();
+
+  let res;
+  if (action === 'start') {
+    res = state.mode === 'systemd'
+      ? svc.start()
+      : await startBackgroundVerified(store, { port, dataDir });
+  } else if (action === 'stop') {
+    res = state.mode === 'systemd' ? svc.stop() : svc.backgroundStop(dataDir);
+  } else if (action === 'restart') {
+    if (state.mode === 'systemd') res = svc.restart();
+    else {
+      svc.backgroundStop(dataDir);
+      res = await startBackgroundVerified(store, { port, dataDir });
+    }
+  } else if (action === 'enable') {
+    res = svc.enable();
+  } else if (action === 'disable') {
+    res = svc.disable();
+  }
+
+  if (!res || (!res.ok && !/not running|already/i.test(res.err || ''))) {
+    warn(`${action}: ${(res && (res.err || res.out)) || 'failed'}`);
+    if (res && res.logTail) out(c.gray(res.logTail));
+    process.exitCode = 1;
+    return;
+  }
+  const past = { start: 'started', stop: 'stopped', restart: 'restarted', enable: 'enabled', disable: 'disabled' };
+  ok(`Service ${past[action] || action}`);
+  const st = svc.statusOf(dataDir);
   info(`state: ${st.active ? c.green('active') : c.gray(st.state)}${st.enabled ? c.gray(' • enabled at boot') : ''}`);
-  if (action === 'restart' || action === 'start') info(`Open: ${c.bold(`http://${lanIp()}:${openStore().get().port || 1212}`)}`);
+  if (action === 'restart' || action === 'start') {
+    const url = forwardedUrl(port) || `http://${lanIp()}:${port}`;
+    info(`Open: ${c.bold(url)}`);
+  }
 }
 
 async function cmdLogs(flags) {
-  if (!svc.unitExists()) {
-    die('Service not installed — logs are on your terminal. Or run: BLUEROUTER_DATA=./data node src/server.js');
+  const store = openStore(flags);
+  const dataDir = store.dir;
+  const state = svc.statusOf(dataDir);
+  const n = Number(flags.lines || flags.n || 60);
+
+  if (!state.installed) {
+    die(`Service not installed — logs are on your terminal.\n  Or run in the foreground: ${c.bold('blue start')}   ${c.gray('(or: node src/server.js)')}`);
   }
+
+  if (state.mode === 'background') {
+    const file = svc.logFile(dataDir);
+    if (flags.follow) {
+      out(c.gray(`  following ${file}  (Ctrl+C to stop)`));
+      svc.followBackgroundLog(dataDir);
+      return;
+    }
+    heading(`Service log (last ${n})`);
+    out(svc.backgroundLogs(dataDir, n) || c.gray('  (no log lines yet)'));
+    blank();
+    out(`  ${c.gray('File:')} ${file}`);
+    blank();
+    return;
+  }
+
   if (flags.follow) {
     out(c.gray('  following journalctl -u bluerouter  (Ctrl+C to stop)'));
     svc.followJournal();
     return;
   }
-  const n = Number(flags.lines || flags.n || 60);
   heading(`Service log (last ${n})`);
   out(svc.journalLines(n) || c.gray('  (no log lines)'));
   blank();
@@ -1026,7 +1259,7 @@ async function cmdUrls() {
   const cfg = store.get();
   const port = Number(cfg.port) || 1212;
   const ip = lanIp();
-  const base = `http://${ip}:${port}`;
+  const base = forwardedUrl(port) || `http://${ip}:${port}`;
   heading('URLs & keys');
   kv('Dashboard', `${base}/`);
   kv('Admin URL', `${base}/#token=${cfg.adminToken}`);
@@ -1155,8 +1388,8 @@ async function cmdRotate(flags) {
 }
 
 async function cmdRestart(flags) {
-  if (!svc.unitExists()) die('Service not installed. Run sudo blue install.');
-  cmdService('restart');
+  if (!svc.statusOf(openStore(flags).dir).installed) die('Service not installed. Run: sudo blue install');
+  await cmdService('restart');
 }
 
 function cmdOpen(flags) {
@@ -1182,8 +1415,8 @@ async function cmdUpdate(flags) {
     info('Resolve it manually, then run: sudo blue restart');
     return;
   }
-  if (svc.unitExists() && !flags['no-restart']) {
-    cmdService('restart');
+  if (svc.statusOf(openStore(flags).dir).installed && !flags['no-restart']) {
+    await cmdService('restart');
   } else {
     info('Restart manually: sudo blue restart (or blue start)');
   }
@@ -1201,7 +1434,7 @@ function printHelp() {
   out(`  ${c.gray('Use:')} ${c.bold('blue <command> [options]')}   ${c.gray(`(default port ${openStore().get().port || 1212}, dashboard http://${ip}:${openStore().get().port || 1212})`)}`);
   const sections = {
     'Server (systemd)': [
-      ['install', 'install + start on this VPS (sudo), --port 1212'],
+      ['install', 'install + start (systemd, or --background without systemd)'],
       ['uninstall', 'stop + remove service (add --purge to delete data)'],
       ['status', 'service, accounts, traffic — everything (--json)'],
       ['start / stop / restart', 'manual control'],
@@ -1238,6 +1471,7 @@ function printHelp() {
   }
   blank();
   out(`  ${c.gray('Quick start:')}  sudo blue install  →  blue add groq <API_KEY>  →  blue check  →  blue test`);
+  out(`  ${c.gray('No systemd (Docker / Codespace / WSL):')}  ${c.bold('blue install --background')}`);
   blank();
 }
 

@@ -12,8 +12,9 @@
     "test": "node test/smoke.js",
     "test:cli": "node test/cli.js",
     "test:ui": "node test/ui.js",
-    "test:all": "node test/smoke.js && node test/cli.js",
-    "demo": "node scripts/demo.js"
+    "test:all": "node test/smoke.js && node test/cli.js && node test/service.js",
+    "demo": "node scripts/demo.js",
+    "test:service": "node test/service.js"
   },
   "engines": {
     "node": ">=18.0.0"

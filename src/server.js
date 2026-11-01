@@ -741,13 +741,20 @@ async function handleAdmin({ req, res, store, p, url, startedAt }) {
   /* --------------------------- dashboard url ----------------------- */
   if (p === '/admin/urls' && method === 'GET') {
     const port = cfg.port;
+    const forwardedHost = req.headers['x-forwarded-host'] || req.headers['x-forwarded-server'];
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const publicBase = forwardedHost
+      ? `${forwardedProto || 'https'}://${String(forwardedHost).split(',')[0].trim()}`
+      : null;
+    const base = publicBase || `http://${lanIp()}:${port}`;
     return send(res, 200, {
       data: {
         local: `http://127.0.0.1:${port}`,
         lan: `http://${lanIp()}:${port}`,
-        apiBase: `http://${lanIp()}:${port}/v1`,
-        dashboard: `http://${lanIp()}:${port}/#token=${cfg.adminToken}`,
-        health: `http://${lanIp()}:${port}/health`,
+        public: publicBase,
+        apiBase: `${base}/v1`,
+        dashboard: `${base}/#token=${cfg.adminToken}`,
+        health: `${base}/health`,
       },
     });
   }
