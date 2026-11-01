@@ -1,0 +1,1353 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * blue — BlueRouter CLI
+ *
+ *   blue install      install + start as a systemd service
+ *   blue uninstall    stop + remove the service
+ *   blue status       everything at a glance
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline');
+const { execFileSync, spawnSync } = require('child_process');
+
+const pkg = require('../package.json');
+const { Store, newSecret } = require('../src/store');
+const { getProvider, allProviders } = require('../src/providers');
+const { checkAccount } = require('../src/server');
+const { lanIp, maskKey, humanDuration, humanNumber, humanBytes } = require('../src/util');
+const svc = require('../src/service');
+
+const ROOT = path.resolve(__dirname, '..');
+const DATA_DIR = process.env.BLUEROUTER_DATA || path.join(ROOT, 'data');
+
+/* ------------------------------------------------------------------ */
+/* Terminal helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+const isTTY = process.stdout.isTTY;
+const NO_COLOR = process.env.NO_COLOR || !isTTY;
+
+const paint = (code) => (s) => (NO_COLOR ? String(s) : `\x1b[${code}m${s}\x1b[0m`);
+const c = {
+  bold: paint('1'),
+  dim: paint('2'),
+  red: paint('31'),
+  green: paint('32'),
+  yellow: paint('33'),
+  blue: paint('34'),
+  magenta: paint('35'),
+  cyan: paint('36'),
+  gray: paint('90'),
+  bgBlue: paint('44;97'),
+};
+
+const stripAnsi = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, '');
+const vlen = (s) => [...stripAnsi(s)].length;
+const pad = (s, n) => String(s) + ' '.repeat(Math.max(0, n - vlen(s)));
+const out = (...a) => console.log(...a);
+const blank = () => out('');
+
+function heading(text) {
+  blank();
+  out(c.bold(`  ${text}`));
+  out(c.gray(`  ${'─'.repeat(Math.max(10, Math.min(70, stripAnsi(text).length + 6)))}`));
+}
+
+function kv(key, value, width = 18) {
+  out(`  ${c.gray(pad(key, width))} ${value}`);
+}
+
+function die(msg, code = 1) {
+  blank();
+  out(`  ${c.red('✖')} ${msg}`);
+  blank();
+  process.exit(code);
+}
+
+function ok(msg) {
+  out(`  ${c.green('✔')} ${msg}`);
+}
+
+function warn(msg) {
+  out(`  ${c.yellow('!')} ${msg}`);
+}
+
+function info(msg) {
+  out(`  ${c.blue('i')} ${msg}`);
+}
+
+function table(headers, rows, { align = [] } = {}) {
+  const all = [headers, ...rows.map((r) => r.map((cell) => (cell == null ? '' : String(cell))))];
+  const widths = headers.map((_, i) => Math.max(...all.map((row) => vlen(row[i] == null ? '' : row[i]))));
+  const line = (row, sep = '  ') => row
+    .map((cell, i) => {
+      const s = cell == null ? '' : String(cell);
+      return align[i] === 'right' ? ' '.repeat(Math.max(0, widths[i] - vlen(s))) + s : pad(s, widths[i]);
+    })
+    .join(sep)
+    .replace(/\s+$/, '');
+  blank();
+  out(`  ${c.gray(line(headers))}`);
+  out(`  ${c.gray(widths.map((w) => '─'.repeat(w)).join('  '))}`);
+  for (const row of rows) out(`  ${line(row)}`);
+  blank();
+}
+
+function ask(question, { def = false } = {}) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`  ${question} ${def ? c.gray('(Y/n)') : c.gray('(y/N)')} `, (answer) => {
+      rl.close();
+      const a = answer.trim().toLowerCase();
+      resolve(a ? a.startsWith('y') : def);
+    });
+  });
+}
+
+function promptSecret(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(`  ${question} `);
+    const stdin = process.stdin;
+    if (!stdin.isTTY) {
+      const rl = readline.createInterface({ input: stdin, output: process.stdout });
+      rl.question('', (a) => {
+        rl.close();
+        resolve(a.trim());
+      });
+      return;
+    }
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    let value = '';
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        const code = ch.charCodeAt(0);
+        if (ch === '\r' || ch === '\n' || code === 4) {
+          cleanup();
+          process.stdout.write('\n');
+          resolve(value.trim());
+          return;
+        }
+        if (code === 3) {
+          cleanup();
+          process.stdout.write('\n');
+          process.exit(130);
+        }
+        if (code === 127 || code === 8) value = value.slice(0, -1);
+        else if (code >= 32) value += ch;
+      }
+    };
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener('data', onData);
+    };
+    stdin.on('data', onData);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Args / store / http                                                 */
+/* ------------------------------------------------------------------ */
+
+const BOOL_FLAGS = new Set(['yes', 'json', 'purge', 'errors', 'force', 'help', 'offline', 'all', 'fresh', 'no-start', 'follow', 'version', 'restart']);
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '-f') flags.follow = true;
+    else if (a === '-y') flags.yes = true;
+    else if (a === '-h') flags.help = true;
+    else if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (!BOOL_FLAGS.has(key) && next !== undefined && !next.startsWith('--')) {
+        flags[key] = next;
+        i += 1;
+      } else {
+        flags[key] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { flags, positional };
+}
+
+function openStore(flags = {}) {
+  const dir = flags['data-dir'] || DATA_DIR;
+  return new Store({ dataDir: dir }).init();
+}
+
+async function serverUp(store) {
+  if (process.env.BLUEROUTER_OFFLINE === '1') return null;
+  const port = Number(store.get().port) || 1212;
+  const health = await svc.probe(port);
+  if (!health) return null;
+  // Make sure we are talking to *this* data directory, not another instance.
+  const mine = store.get().instanceId;
+  if (mine && health.instanceId && health.instanceId !== mine) return null;
+  return health;
+}
+
+async function api(store, method, routePath, body) {
+  const cfg = store.get();
+  const port = Number(cfg.port) || 1212;
+  const res = await fetch(`http://127.0.0.1:${port}${routePath}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${cfg.adminToken}`,
+      'content-type': 'application/json',
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = json && json.error ? json.error.message || json.error.type : `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return json;
+}
+
+function statusLabel(account) {
+  if (!account.enabled) return c.gray('disabled');
+  if (account.cooldownMs > 0) {
+    const h = account.health || {};
+    const tag = h.status === 'invalid-key' ? 'bad key' : h.status === 'rate-limited' ? 'rate limited' : 'cooling';
+    return c.yellow(`${tag} ${humanDuration(account.cooldownMs)}`);
+  }
+  const h = (account.health || {}).status;
+  if (h === 'ok') return c.green('active');
+  if (h === 'invalid-key') return c.red('invalid key');
+  if (h === 'error') return c.red('error');
+  if (account.stats && account.stats.success > 0) return c.green('active');
+  return c.gray('unchecked');
+}
+
+function localPublicKeys(store) {
+  return store.publicKeys();
+}
+
+async function listKeys(store, filterProvider) {
+  const up = await serverUp(store);
+  let keys;
+  if (up) {
+    const r = await api(store, 'GET', '/admin/keys');
+    keys = r.data;
+  } else {
+    keys = localPublicKeys(store);
+  }
+  return filterProvider ? keys.filter((k) => k.provider === filterProvider) : keys;
+}
+
+/* ------------------------------------------------------------------ */
+/* Commands: lifecycle                                                 */
+/* ------------------------------------------------------------------ */
+
+async function cmdInstall(flags) {
+  if (!svc.isRoot()) {
+    die(`Install needs root. Run: ${c.bold('sudo blue install')}`);
+  }
+  if (!svc.systemdAvailable()) {
+    die('systemd not found on this machine. Use another VPS or run `blue start` inside tmux/screen.');
+  }
+  const major = Number(String(process.versions.node).split('.')[0]);
+  if (major < 18) die(`Node.js 18+ required (found ${process.versions.node}).`);
+
+  const store = openStore(flags);
+  const cfg = store.get();
+  let port = Number(flags.port || cfg.port || 1212);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) die(`Invalid port: ${flags.port}`);
+  if (cfg.port !== port) {
+    cfg.port = port;
+    store.save();
+  }
+  const dataDir = store.dir;
+  if (/\s/.test(ROOT) || /\s/.test(dataDir)) {
+    die(`Install paths cannot contain spaces:\n  repo: ${ROOT}\n  data: ${dataDir}\n  Move the checkout somewhere like /opt/bluerouter and try again.`);
+  }
+  fs.mkdirSync(dataDir, { recursive: true });
+
+  heading('Installing BlueRouter');
+  kv('Version', pkg.version);
+  kv('Node.js', `${process.version}  ${c.gray(process.execPath)}`);
+  kv('Install dir', ROOT);
+  kv('Data dir', dataDir);
+  kv('Port', String(port));
+
+  // 1. CLI symlink -> `blue` from anywhere
+  let symlinkNote = 'skipped';
+  try {
+    const target = path.join(ROOT, 'bin', 'blue');
+    fs.chmodSync(target, 0o755);
+    const link = '/usr/local/bin/blue';
+    if (isSymlink(link)) {
+      const existing = fs.readlinkSync(link);
+      if (existing !== target) {
+        fs.unlinkSync(link);
+        fs.symlinkSync(target, link);
+        symlinkNote = `${link} → ${target}`;
+      } else {
+        symlinkNote = link;
+      }
+    } else if (fs.existsSync(link)) {
+      symlinkNote = `${link} exists (not a symlink) — using sudo blue instead`;
+    } else {
+      fs.symlinkSync(target, link);
+      symlinkNote = `${link} → ${target}`;
+    }
+  } catch (err) {
+    symlinkNote = `failed (${err.message})`;
+  }
+
+  // 2. systemd unit
+  svc.writeUnit({ repoDir: ROOT, dataDir, nodeBin: process.execPath, port });
+  svc.daemonReload();
+  svc.enable();
+  const started = svc.restart();
+  if (!started.ok) {
+    warn(`systemctl restart returned: ${started.err || started.out}`);
+  }
+
+  // 3. wait for it to answer
+  let health = null;
+  for (let i = 0; i < 24; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    health = await svc.probe(port, 700);
+    if (health) break;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!health) {
+    blank();
+    warn('Service did not answer on /health yet. Last log lines:');
+    blank();
+    out(svc.journalLines(25));
+    die('Install finished but the server is not responding. Check the log above (journalctl -u bluerouter -n 50).');
+  }
+
+  // 4. final report
+  const serviceState = svc.status();
+  const ip = lanIp();
+  const base = `http://${ip}:${port}`;
+
+  heading('BlueRouter is live');
+  kv('Service', c.green(`active`) + c.gray(`  (systemd: ${svc.UNIT_NAME}, ${serviceState.enabled ? 'auto-start on boot' : 'manual start'})`));
+  kv('Dashboard', c.bold(`${base}/`));
+  kv('Admin URL', `${base}/#token=${cfg.adminToken}`);
+  kv('API base', c.bold(`${base}/v1`));
+  kv('Health', `${base}/health`);
+  kv('API key', c.green(cfg.clientKey));
+  kv('Admin token', c.gray(cfg.adminToken));
+  kv('CLI symlink', symlinkNote);
+  kv('Data', dataDir);
+  blank();
+  out(`  ${c.gray('Next steps')}`);
+  out(`  ${c.gray('•')} Add accounts:      ${c.bold(`blue add groq <API_KEY>`)}   ${c.gray('(ya: blue add groq k1 k2 k3)')}`);
+  out(`  ${c.gray('•')} Check accounts:    ${c.bold('blue check')}`);
+  out(`  ${c.gray('•')} Send a test:       ${c.bold('blue test')}`);
+  out(`  ${c.gray('•')} Live logs:         ${c.bold('blue logs -f')}`);
+  blank();
+  out(`  ${c.gray('If the dashboard is not reachable from outside:')} ${c.bold(`ufw allow ${port}/tcp`)} ${c.gray('(and open the port in your VPS firewall panel)')}`);
+  blank();
+}
+
+function isSymlink(p) {
+  try {
+    return fs.lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+async function cmdUninstall(flags) {
+  if (!svc.isRoot()) die(`Uninstall needs root. Run: ${c.bold('sudo blue uninstall')}`);
+  if (!svc.unitExists()) {
+    warn('BlueRouter service is not installed.');
+    if (flags.purge) await purgeData(flags, flags['data-dir'] || DATA_DIR);
+    return;
+  }
+  if (!flags.yes) {
+    if (!process.stdin.isTTY) die('Refusing to uninstall without confirmation. Re-run with --yes.');
+    const go = await ask('Stop and remove the BlueRouter service?', { def: false });
+    if (!go) {
+      info('Cancelled.');
+      return;
+    }
+  }
+
+  heading('Uninstalling BlueRouter');
+  const store = openStore(flags);
+  const dataDir = store.dir;
+  kv('Service', svc.UNIT_NAME);
+  kv('Data (kept)', dataDir);
+
+  const stopped = svc.stop();
+  if (stopped.ok) ok('Service stopped');
+  svc.disable();
+  svc.removeUnit();
+  svc.daemonReload();
+  ok(`Removed ${svc.UNIT_PATH}`);
+
+  try {
+    const link = '/usr/local/bin/blue';
+    if (isSymlink(link) && fs.readlinkSync(link) === path.join(ROOT, 'bin', 'blue')) {
+      fs.unlinkSync(link);
+      ok('Removed /usr/local/bin/blue');
+    }
+  } catch { /* ignore */ }
+
+  if (flags.purge) await purgeData(flags, dataDir);
+  else {
+    blank();
+    info(`Your accounts are still in ${dataDir}.`);
+    info(`To delete everything too: ${c.bold('sudo blue uninstall --purge --yes')}`);
+    info(`To install again later:  ${c.bold('sudo blue install')}`);
+    blank();
+  }
+}
+
+async function purgeData(flags, dir) {
+  const dataDir = path.resolve(dir || flags['data-dir'] || DATA_DIR);
+  if (dataDir === '/' || dataDir.length < 4 || dataDir === os.homedir()) {
+    die(`Refusing to delete ${dataDir} — that looks wrong.`);
+  }
+  if (!flags.yes) {
+    if (!process.stdin.isTTY) die('Refusing to delete data without --yes.');
+    const go = await ask(`Delete ALL data in ${dataDir} (accounts, keys, logs)?`, { def: false });
+    if (!go) {
+      info('Data kept.');
+      return;
+    }
+  }
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  ok(`Deleted ${dataDir}`);
+}
+
+async function cmdStatus(flags) {
+  const store = openStore(flags);
+  const cfg = store.get();
+  const port = Number(cfg.port) || 1212;
+  const state = svc.status();
+  const health = await svc.probe(port);
+
+  let stats = null;
+  if (health) {
+    try {
+      stats = (await api(store, 'GET', '/admin/stats')).data;
+    } catch { /* token mismatch, ignore */ }
+  }
+
+  const keys = health ? (await api(store, 'GET', '/admin/keys').catch(() => ({ data: localPublicKeys(store) }))).data : localPublicKeys(store);
+
+  if (flags.json) {
+    out(JSON.stringify({ service: state, health, config: store.publicConfig(), accounts: keys, stats }, null, 2));
+    return;
+  }
+
+  blank();
+  out(`  ${c.bgBlue(' BlueRouter ')} ${c.gray(`v${pkg.version}`)}   ${c.gray('one API for all your AI accounts')}`);
+  blank();
+
+  /* service */
+  const installed = state.installed;
+  const active = state.active || !!health;
+  const svcLabel = installed
+    ? (active ? c.green('● running') : c.red('● stopped')) + c.gray(`  systemd (${state.enabled ? 'enabled' : 'disabled'})`)
+    : (health ? c.yellow('● running') + c.gray('  foreground (blue start)') : c.gray('○ not installed'));
+  kv('Server', svcLabel);
+  if (state.pid) kv('PID', String(state.pid));
+  if (health) {
+    const up = stats ? humanDuration(stats.uptimeMs) : '—';
+    kv('Uptime', up);
+    kv('Version', health.version);
+  }
+  kv('Port', String(port));
+  kv('Dashboard', `http://${lanIp()}:${port}`);
+  kv('API base', `http://${lanIp()}:${port}/v1`);
+  if (health) kv('Health', `${c.green(health.status)} ${c.gray(`(${health.accounts} accounts, ${health.providers} provider${health.providers === 1 ? '' : 's'})`)}`);
+
+  /* accounts */
+  const activeKeys = keys.filter((k) => k.enabled);
+  const cooling = keys.filter((k) => k.cooldownMs > 0);
+  const low = keys.filter((k) => !k.enabled || (k.cooldownMs > 0 && k.health && k.health.status === 'invalid-key'));
+
+  heading('Accounts');
+  if (!keys.length) {
+    info(`No accounts yet. Add your first one: ${c.bold('blue add groq <API_KEY>')}`);
+    blank();
+  } else {
+    const rows = keys.map((k) => [
+      c.gray(k.id),
+      k.name,
+      k.provider,
+      c.gray(k.masked),
+      statusLabel(k),
+      humanNumber(k.stats.requests),
+      c.gray(`${humanNumber(k.stats.tokensIn)}/${humanNumber(k.stats.tokensOut)}`),
+      k.lastError ? c.gray(String(k.lastError).slice(0, 34)) : c.gray('—'),
+    ]);
+    table(['ID', 'NAME', 'PROVIDER', 'KEY', 'STATUS', 'REQS', 'IN/OUT', 'LAST ERROR'], rows);
+    out(`  ${c.gray(`${keys.length} accounts`)}  ${c.gray('•')}  ${c.green(`${activeKeys.length} enabled`)}  ${c.gray('•')}  ${c.yellow(`${cooling.length} cooling`)}`);
+  }
+
+  /* stats */
+  if (stats) {
+    heading('Traffic');
+    const rate = stats.totals.requests ? Math.round((stats.totals.success / stats.totals.requests) * 100) : 100;
+    kv('Requests', `${humanNumber(stats.totals.requests)}  ${c.green(`${rate}% ok`)}  ${c.gray(`(${humanNumber(stats.totals.fail)} failed)`)}`);
+    kv('Tokens', `${humanNumber(stats.totals.tokensIn)} in / ${humanNumber(stats.totals.tokensOut)} out`);
+    kv('Last hour', `${humanNumber(stats.lastHour.requests)} requests ${c.gray(`(${stats.lastHour.fail} failed)`)}`);
+    kv('Avg latency', stats.recentLatencyMs != null ? `${stats.recentLatencyMs} ms` : '—');
+    kv('Memory', humanBytes(stats.memory.rss));
+    kv('Routing', `${stats.routing.mode} mode, max ${stats.routing.maxRetries} retries`);
+  }
+
+  if (!installed) {
+    blank();
+    info(`Service not installed. Run ${c.bold('sudo blue install')} to make it permanent (auto-restart + boot).`);
+    blank();
+  } else if (!active) {
+    blank();
+    warn(`Not running. Check logs: ${c.bold('blue logs')}   Start: ${c.bold('sudo blue start')}`);
+    blank();
+  } else {
+    blank();
+  }
+}
+
+async function cmdStart(flags) {
+  const store = openStore(flags);
+  const port = Number(flags.port || store.get().port) || 1212;
+  if (svc.unitExists() && svc.status().active && !flags.force) {
+    die(`Service is already running. Use ${c.bold('blue restart')} or ${c.bold('blue status')}.`);
+  }
+  const { start, shutdown } = require('../src/server');
+  const instance = await start({ port, host: store.get().host || '0.0.0.0', dataDir: store.dir });
+  info(`API key: ${c.green(store.get().clientKey)}   ${c.gray('(blue url for all URLs)')}`);
+  const stop = async (sig) => {
+    await shutdown(instance, sig);
+    process.exit(0);
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
+}
+
+function cmdService(action) {
+  if (!svc.unitExists()) {
+    die(`Service not installed. Run ${c.bold('sudo blue install')} first.`);
+  }
+  const map = { start: svc.start, stop: svc.stop, restart: svc.restart, enable: svc.enable, disable: svc.disable };
+  const fn = map[action];
+  const res = fn();
+  if (!res.ok && !/not running|already/i.test(res.err || '')) {
+    warn(`${action}: ${res.err || res.out}`);
+    process.exitCode = 1;
+    return;
+  }
+  ok(`Service ${action}${action.endsWith('e') ? 'd' : 'ed'}`);
+  const st = svc.status();
+  info(`state: ${st.active ? c.green('active') : c.gray(st.state)}${st.enabled ? c.gray(' • enabled at boot') : ''}`);
+  if (action === 'restart' || action === 'start') info(`Open: ${c.bold(`http://${lanIp()}:${openStore().get().port || 1212}`)}`);
+}
+
+async function cmdLogs(flags) {
+  if (!svc.unitExists()) {
+    die('Service not installed — logs are on your terminal. Or run: BLUEROUTER_DATA=./data node src/server.js');
+  }
+  if (flags.follow) {
+    out(c.gray('  following journalctl -u bluerouter  (Ctrl+C to stop)'));
+    svc.followJournal();
+    return;
+  }
+  const n = Number(flags.lines || flags.n || 60);
+  heading(`Service log (last ${n})`);
+  out(svc.journalLines(n) || c.gray('  (no log lines)'));
+  blank();
+}
+
+/* ------------------------------------------------------------------ */
+/* Commands: accounts                                                  */
+/* ------------------------------------------------------------------ */
+
+function providerKnown(store, id) {
+  const p = getProvider(id, store.get());
+  if (!p) {
+    die(`Unknown provider "${id}".\n  Known: ${Object.keys(require('../src/providers').DEFAULT_PROVIDERS).join(', ')}\n  Add a custom one: blue provider set custom baseUrl https://api.example.com/v1`);
+  }
+  return p;
+}
+
+async function cmdAdd(flags, positional) {
+  const store = openStore(flags);
+  const providerId = (positional[1] || '').toLowerCase();
+  if (!providerId || providerId === 'help') {
+    printAddHelp();
+    return;
+  }
+  const provider = providerKnown(store, providerId);
+
+  let keys = positional.slice(2);
+  if (flags.file) {
+    const file = path.resolve(String(flags.file));
+    if (!fs.existsSync(file)) die(`File not found: ${file}`);
+    keys = keys.concat(fs.readFileSync(file, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')));
+  }
+  if (!keys.length) {
+    blank();
+    out(`  ${c.gray(provider.label)} ${c.gray(`• ${provider.baseUrl}`)}`);
+    if (provider.quota && provider.quota.note) out(`  ${c.gray(provider.quota.note)}`);
+    blank();
+    const answer = await promptSecret(`Paste ${provider.label} API key(s) [space/comma separated, hidden]:`);
+    keys = answer.split(/[\s,;]+/).map((k) => k.trim()).filter(Boolean);
+  }
+  if (!keys.length) die('No key given.');
+
+  const up = await serverUp(store);
+  let added = [];
+  const failed = [];
+
+  const entries = keys.map((key, i) => ({
+    key,
+    name: flags.name ? (keys.length > 1 ? `${flags.name}-${i + 1}` : String(flags.name)) : '',
+  }));
+
+  if (up) {
+    if (entries.every((e) => !e.name)) {
+      const res = await api(store, 'POST', '/admin/keys/bulk', {
+        provider: providerId,
+        keys,
+        name: '',
+      }).catch((err) => {
+        warn(`Admin API failed (${err.message}); falling back to local config.`);
+        return null;
+      });
+      if (res) {
+        added = res.data.added;
+        failed.push(...res.data.skipped);
+      } else {
+        added = addLocally(store, providerId, entries, failed);
+      }
+    } else {
+      for (const entry of entries) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const res = await api(store, 'POST', '/admin/keys', { provider: providerId, key: entry.key, name: entry.name });
+          added.push(res.data);
+        } catch (err) {
+          failed.push({ key: maskKey(entry.key), reason: err.message });
+        }
+      }
+    }
+  } else {
+    added = addLocally(store, providerId, entries, failed);
+  }
+
+  heading(`Added to ${provider.label}`);
+  for (const a of added) out(`  ${c.green('✔')} ${pad(a.name, 24)} ${c.gray(a.masked)}  ${c.gray(a.id)}`);
+  for (const f of failed) out(`  ${c.red('✖')} ${f.key || f.keyMasked || ''} ${c.gray(f.reason)}`);
+  blank();
+  let total = store.keys(providerId).length;
+  if (up) {
+    const live = await api(store, 'GET', '/admin/keys').catch(() => null);
+    if (live) total = live.data.filter((k) => k.provider === providerId).length;
+  }
+  info(`${added.length} account(s) registered. Total for ${provider.label}: ${total}`);
+  if (added.length) {
+    info(`Run ${c.bold('blue check')} to verify keys, then ${c.bold('blue test')} to send a request.`);
+  }
+  blank();
+}
+
+function addLocally(store, providerId, entries, failed) {
+  const added = [];
+  for (const entry of entries) {
+    try {
+      added.push(store.publicKey(store.addKey({ provider: providerId, key: entry.key, name: entry.name })));
+    } catch (err) {
+      failed.push({ key: maskKey(entry.key), reason: err.message });
+    }
+  }
+  return added;
+}
+
+function printAddHelp() {
+  heading('blue add — register API accounts');
+  out(`  ${c.bold('blue add <provider> <key>')}          add one account`);
+  out(`  ${c.bold('blue add groq k1 k2 k3')}            add many at once`);
+  out(`  ${c.bold('blue add groq --file keys.txt')}     one key per line`);
+  out(`  ${c.bold('blue add groq')}                     paste keys interactively (hidden)`);
+  blank();
+  out(`  ${c.gray('Providers:')} ${Object.keys(require('../src/providers').DEFAULT_PROVIDERS).join(', ')}`);
+  blank();
+  out(`  ${c.gray('Example:')} blue add groq gsk_xxxxxxxxxxxxxxxx`);
+  blank();
+}
+
+async function cmdKeys(flags, positional) {
+  const store = openStore(flags);
+  const filter = positional[1];
+  const keys = await listKeys(store, filter);
+  heading(filter ? `Accounts — ${filter}` : 'Accounts');
+  if (!keys.length) {
+    info(`No accounts${filter ? ` for ${filter}` : ''}. Add one: ${c.bold('blue add groq <API_KEY>')}`);
+    blank();
+    return;
+  }
+  const rows = keys.map((k) => [
+    c.gray(k.id),
+    k.name,
+    k.provider,
+    c.gray(k.masked),
+    statusLabel(k),
+    humanNumber(k.stats.requests),
+    humanNumber(k.stats.tokensIn + k.stats.tokensOut),
+    k.lastUsedAt ? c.gray(ago(k.lastUsedAt)) : c.gray('never'),
+  ]);
+  table(['ID', 'NAME', 'PROVIDER', 'KEY', 'STATUS', 'REQS', 'TOKENS', 'LAST USED'], rows);
+  const byProvider = {};
+  for (const k of keys) byProvider[k.provider] = (byProvider[k.provider] || 0) + 1;
+  out(`  ${c.gray(Object.entries(byProvider).map(([p, n]) => `${p}: ${n}`).join('   •   '))}`);
+  out(`  ${c.gray('IDs are stable — use them with blue rm / blue enable / blue disable / blue check')}`);
+  blank();
+}
+
+function ago(isoStr) {
+  const ms = Date.now() - Date.parse(isoStr);
+  return ms < 5000 ? 'just now' : `${humanDuration(ms)} ago`;
+}
+
+async function cmdRm(flags, positional) {
+  const store = openStore(flags);
+  const id = positional[1];
+  if (!id) die(`Which account? Usage: ${c.bold('blue rm <id>')}  (IDs: blue keys)`);
+  const up = await serverUp(store);
+  const keys = up ? (await api(store, 'GET', '/admin/keys')).data : localPublicKeys(store);
+  const target = keys.find((k) => k.id === id || k.masked === id || k.id === `acc_${id}`);
+  if (!target) die(`Account "${id}" not found. Run: blue keys`);
+
+  if (!flags.yes && process.stdin.isTTY) {
+    const go = await ask(`Remove ${c.bold(target.name)} (${target.provider}, ${target.masked})?`);
+    if (!go) {
+      info('Cancelled.');
+      return;
+    }
+  }
+  if (up) await api(store, 'DELETE', `/admin/keys/${target.id}`);
+  else store.removeKey(target.id);
+  ok(`Removed ${target.name} ${c.gray(target.masked)}`);
+  blank();
+}
+
+async function cmdToggle(flags, positional, enabled) {
+  const store = openStore(flags);
+  const id = positional[1];
+  if (!id) die(`Usage: blue ${enabled ? 'enable' : 'disable'} <id>`);
+  const up = await serverUp(store);
+  const keys = up ? (await api(store, 'GET', '/admin/keys')).data : localPublicKeys(store);
+  const target = keys.find((k) => k.id === id);
+  if (!target) die(`Account "${id}" not found`);
+  if (up) await api(store, 'POST', `/admin/keys/${target.id}/${enabled ? 'enable' : 'disable'}`);
+  else store.updateKey(target.id, { enabled });
+  ok(`${target.name} ${enabled ? c.green('enabled') : c.yellow('disabled')}`);
+  blank();
+}
+
+async function cmdRename(flags, positional) {
+  const store = openStore(flags);
+  const id = positional[1];
+  const name = positional.slice(2).join(' ');
+  if (!id || !name) die('Usage: blue rename <id> <new name>');
+  const up = await serverUp(store);
+  if (up) await api(store, 'POST', `/admin/keys/${id}/rename`, { name });
+  else store.renameKey(id, name);
+  ok(`Renamed ${id} → ${name}`);
+  blank();
+}
+
+async function cmdCheck(flags, positional) {
+  const store = openStore(flags);
+  const targetId = positional[1];
+  const up = await serverUp(store);
+
+  if (up) {
+    if (targetId && targetId !== 'all') {
+      heading('Health check');
+      const res = await api(store, 'POST', `/admin/keys/${targetId}/check`).catch((e) => { die(e.message); });
+      printCheckRows([{ ...res.data.account, check: res.data }]);
+      return;
+    }
+    heading('Health check — all accounts');
+    const res = await api(store, 'POST', '/admin/check-all');
+    const keys = (await api(store, 'GET', '/admin/keys')).data;
+    const rows = keys.map((k) => ({ ...k, check: res.data.find((r) => r.id === k.id) || {} }));
+    printCheckRows(rows);
+    return;
+  }
+
+  // offline: talk to providers directly
+  const keys = localPublicKeys(store);
+  const list = targetId && targetId !== 'all' ? keys.filter((k) => k.id === targetId) : keys;
+  if (!list.length) die('No accounts to check. Add one: blue add groq <API_KEY>');
+  heading('Health check — direct');
+  const results = [];
+  for (const k of list) {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await checkAccount(store, store.getKey(k.id));
+    results.push({ ...store.publicKey(store.getKey(k.id)), check: r });
+  }
+  store.flush();
+  printCheckRows(results);
+}
+
+function printCheckRows(rows) {
+  const data = rows.map((k) => {
+    const r = k.check || {};
+    const okFlag = r.ok === true || r.status === 'ok';
+    const label = okFlag ? c.green('working') : r.status === 'invalid-key' ? c.red('invalid key') : r.status === 'rate-limited' ? c.yellow('rate limited') : c.red('error');
+    return [k.id, k.name, k.provider, k.masked, label, r.latencyMs != null ? `${Math.round(r.latencyMs)} ms` : c.gray('—'), r.detail && !okFlag ? c.gray(String(r.detail).slice(0, 50)) : ''];
+  });
+  table(['ID', 'NAME', 'PROVIDER', 'KEY', 'HEALTH', 'LATENCY', 'DETAIL'], data);
+  const good = rows.filter((k) => (k.check || {}).ok === true || (k.check || {}).status === 'ok').length;
+  out(`  ${c.green(`${good} working`)}   ${c.gray(`${rows.length - good} failing`)}   ${c.gray(`(${rows.length} checked)`)}`);
+  blank();
+  if (good < rows.length) info(`Fix or remove failing keys, or run ${c.bold('blue reset')} to clear cooldowns.`);
+  blank();
+}
+
+async function cmdReset(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  if (up) await api(store, 'POST', '/admin/cooldowns/clear');
+  else store.clearCooldowns();
+  ok('All cooldowns cleared — every account is eligible again.');
+  blank();
+}
+
+async function cmdTest(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  if (!up) die(`Server is not running. Start it with ${c.bold('blue install')} or ${c.bold('blue start')}.`);
+  const body = {
+    provider: flags.provider || null,
+    model: flags.model || '',
+    prompt: flags.prompt || '',
+    max_tokens: Number(flags['max-tokens'] || flags.max_tokens || 64),
+  };
+  heading('Live test');
+  info(`model: ${c.bold(flags.model || '(auto — first model of your first account)')}${flags.provider ? `   provider: ${flags.provider}` : ''}`);
+  const started = Date.now();
+  const res = await api(store, 'POST', '/admin/test', body).catch((err) => die(err.message));
+  const d = res.data;
+  blank();
+  if (d.ok) {
+    kv('Status', c.green('200 OK'));
+    kv('Provider', d.provider || '—');
+    kv('Account', d.account || '—');
+    kv('Model', d.model || '—');
+    kv('Latency', `${d.ms} ms`);
+    if (d.usage) kv('Tokens', `${d.usage.prompt_tokens || 0} in / ${d.usage.completion_tokens || 0} out`);
+    blank();
+    out(`  ${c.gray('Reply:')} ${d.reply}`);
+  } else {
+    kv('Status', c.red(String(d.status)));
+    kv('Error', d.error || 'unknown error');
+  }
+  blank();
+  if (!d.ok && /no_accounts|no healthy|configuration/i.test(d.error || '')) {
+    info(`Add an account first: ${c.bold('blue add groq <API_KEY>')}`);
+    blank();
+  }
+  void started;
+}
+
+/* ------------------------------------------------------------------ */
+/* Commands: providers & config                                        */
+/* ------------------------------------------------------------------ */
+
+async function cmdProviders(flags) {
+  const store = openStore(flags);
+  const cfg = store.get();
+  const up = await serverUp(store);
+  let rowsData;
+  if (up) rowsData = (await api(store, 'GET', '/admin/providers')).data;
+  else {
+    rowsData = allProviders(cfg).map((p) => {
+      const accounts = store.keys(p.id);
+      return {
+        ...p,
+        accounts: accounts.length,
+        active: accounts.filter((a) => a.enabled).length,
+        daily: store.providerDaily(p.id),
+      };
+    });
+  }
+  heading('Providers');
+  const rows = rowsData.map((p) => [
+    c.bold(p.id),
+    p.label,
+    p.enabled ? c.green('on') : c.gray('off'),
+    p.accounts ? `${p.accounts}${p.active !== p.accounts ? c.gray(` (${p.active} on)`) : ''}` : c.gray('—'),
+    c.gray(p.quota && p.quota.requestsPerMinute ? p.quota.requestsPerMinute : '—'),
+    c.gray(humanNumber((p.daily && p.daily.requests) || 0)),
+  ]);
+  table(['ID', 'NAME', 'ENABLED', 'ACCOUNTS', 'RATE LIMIT', 'REQS TODAY'], rows);
+  out(`  ${c.gray('Add: blue add <provider> <key>     Change: blue provider set <id> <field> <value>')}`);
+  out(`  ${c.gray('Fields: enabled, baseUrl, protocol, authStyle, models')}`);
+  blank();
+}
+
+async function cmdProviderSet(flags, positional) {
+  const store = openStore(flags);
+  const id = positional[2];
+  const field = positional[3];
+  const rest = positional.slice(4);
+  if (!id || !field || !rest.length) die('Usage: blue provider set <id> <field> <value>\n  fields: enabled, baseUrl, protocol, authStyle, models');
+  const value = rest.join(' ');
+  let typed = value;
+  if (field === 'enabled') typed = !/^(false|0|no|off)$/i.test(value);
+  if (field === 'models') typed = value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!['enabled', 'baseUrl', 'protocol', 'authStyle', 'models'].includes(field)) die(`Unknown field "${field}"`);
+
+  const up = await serverUp(store);
+  let saved = false;
+  if (up) {
+    try {
+      await api(store, 'PATCH', `/admin/providers/${id}`, { [field]: typed });
+      saved = true;
+    } catch (err) {
+      warn(`Admin API failed (${err.message}); writing local config instead.`);
+    }
+  }
+  if (!saved) {
+    const cfg = store.get();
+    if (!cfg.providers[id]) cfg.providers[id] = {};
+    cfg.providers[id][field] = typed;
+    store.save();
+  }
+  ok(`provider ${id}: ${field} = ${Array.isArray(typed) ? typed.join(', ') : typed}`);
+}
+
+async function cmdModels(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  heading('Models');
+  if (!up) {
+    const active = new Set(store.keys().filter((k) => k.enabled).map((k) => k.provider));
+    for (const p of allProviders(store.get())) {
+      if (!p.enabled || !active.has(p.id)) continue;
+      out(`  ${c.bold(p.label)} ${c.gray(`(${p.id})`)}`);
+      for (const m of p.models || []) out(`    ${m}`);
+      blank();
+    }
+    info('Start the server for a live model list (blue models hits each provider).');
+    blank();
+    return;
+  }
+  const res = await api(store, 'GET', `/admin/models${flags.fresh ? '?fresh=1' : ''}`);
+  if (!res.data.length) {
+    info(`No providers with accounts yet. ${c.bold('blue add groq <API_KEY>')}`);
+    blank();
+    return;
+  }
+  for (const p of res.data) {
+    out(`  ${c.bold(p.label)} ${c.gray(`(${p.provider})`)} ${p.live ? c.green('live') : c.gray('configured')} ${c.gray(`${p.models.length} models`)}`);
+    for (const m of p.models.slice(0, 20)) out(`    ${m}`);
+    if (p.models.length > 20) out(c.gray(`    … +${p.models.length - 20} more (dashboard ➜ Models)`));
+    blank();
+  }
+}
+
+async function cmdConfig(flags, positional) {
+  const store = openStore(flags);
+  const action = positional[1] || 'show';
+  if (action === 'get' && positional[2]) {
+    const val = positional[2].split('.').reduce((a, k) => (a == null ? a : a[k]), store.get());
+    out(typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val));
+    return;
+  }
+  if (action === 'set') {
+    const keyPath = positional[2];
+    const valueArgs = positional.slice(3);
+    const raw = valueArgs.join(' ');
+    if (!keyPath || !valueArgs.length) die('Usage: blue config set <path> <value>   e.g. blue config set routing.maxRetries 5');
+    let value = raw;
+    try {
+      value = JSON.parse(raw);
+    } catch { /* keep string */ }
+    if (keyPath.endsWith('.models') && typeof value === 'string') {
+      value = value.split(',').map((m) => m.trim()).filter(Boolean);
+    }
+    const up = await serverUp(store);
+    const top = keyPath.split('.')[0];
+    if (up && ['port', 'routing', 'requestLog'].includes(top)) {
+      const payload = top === 'port' ? { port: value } : { [top]: { [keyPath.split('.').slice(1).join('.')]: value } };
+      try {
+        const res = await api(store, 'PATCH', '/admin/config', payload);
+        ok(`${keyPath} = ${JSON.stringify(value)}${res.restartRequired ? c.yellow('  (restart required: blue restart)') : ''}`);
+        return;
+      } catch (err) {
+        warn(`Admin API failed (${err.message}); writing local config instead.`);
+      }
+    }
+    store.setPath(keyPath, value);
+    ok(`${keyPath} = ${JSON.stringify(value)}`);
+    if (up) warn('Server is running — restart to apply: blue restart');
+    return;
+  }
+  // show
+  const cfg = store.get();
+  heading('Configuration');
+  kv('Config file', store.configPath);
+  kv('Data dir', store.dir);
+  kv('Port', String(cfg.port));
+  kv('Host', cfg.host);
+  kv('Routing mode', cfg.routing.mode);
+  kv('Max retries', String(cfg.routing.maxRetries));
+  kv('Cooldown', `${cfg.routing.cooldownSeconds}s`);
+  kv('Timeout', `${Math.round(cfg.routing.timeoutMs / 1000)}s`);
+  kv('Force model', cfg.routing.forceModel || c.gray('(auto)'));
+  kv('Request log', cfg.requestLog.enabled ? `on (${cfg.requestLog.maxEntries} entries)` : 'off');
+  blank();
+  out(`  ${c.gray('Set: blue config set routing.maxRetries 5')}`);
+  blank();
+}
+
+async function cmdUrls() {
+  const store = openStore();
+  const cfg = store.get();
+  const port = Number(cfg.port) || 1212;
+  const ip = lanIp();
+  const base = `http://${ip}:${port}`;
+  heading('URLs & keys');
+  kv('Dashboard', `${base}/`);
+  kv('Admin URL', `${base}/#token=${cfg.adminToken}`);
+  kv('API base', c.bold(`${base}/v1`));
+  kv('Local', `http://127.0.0.1:${port}`);
+  kv('Health', `${base}/health`);
+  blank();
+  kv('API key', c.green(cfg.clientKey));
+  kv('Admin token', c.gray(cfg.adminToken));
+  blank();
+  out(`  ${c.gray('curl:')}`);
+  out(`  ${c.cyan(`curl ${base}/v1/chat/completions \\`)}`);
+  out(`  ${c.cyan(`  -H "Authorization: Bearer ${cfg.clientKey}" \\`)}`);
+  out(`  ${c.cyan('  -H "Content-Type: application/json" \\')}`);
+  out(`  ${c.cyan('  -d \'{"model":"llama-3.3-70b-versatile","messages":[{"role":"user","content":"hi"}]}\'')}`);
+  blank();
+  out(`  ${c.gray('Python (OpenAI SDK):')}`);
+  out(`  ${c.cyan('from openai import OpenAI')}`);
+  out(`  ${c.cyan(`client = OpenAI(base_url="${base}/v1", api_key="${cfg.clientKey}")`)}`);
+  blank();
+}
+
+async function cmdStats(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  let stats;
+  if (up) {
+    stats = (await api(store, 'GET', '/admin/stats')).data;
+  } else {
+    const keys = localPublicKeys(store);
+    const totals = keys.reduce((a, k) => {
+      a.requests += k.stats.requests;
+      a.success += k.stats.success;
+      a.fail += k.stats.fail;
+      a.tokensIn += k.stats.tokensIn;
+      a.tokensOut += k.stats.tokensOut;
+      return a;
+    }, { requests: 0, success: 0, fail: 0, tokensIn: 0, tokensOut: 0 });
+    stats = {
+      uptimeMs: Date.now() - store.startedAt,
+      totals: { ...totals, accounts: keys.length, activeAccounts: keys.filter((k) => k.enabled).length },
+      lastHour: { requests: 0, fail: 0, tokens: 0 },
+      recentLatencyMs: null,
+      memory: { rss: process.memoryUsage().rss },
+      routing: store.get().routing,
+      providers: [],
+      minute: store.minute,
+    };
+    warn('Server is down — showing numbers saved on disk.');
+  }
+  heading('Usage');
+  const rate = stats.totals.requests ? Math.round((stats.totals.success / stats.totals.requests) * 100) : 100;
+  kv('Requests', `${humanNumber(stats.totals.requests)} ${c.gray(`(${rate}% success, ${stats.totals.fail} failed)`)}`);
+  kv('Tokens', `${humanNumber(stats.totals.tokensIn)} in / ${humanNumber(stats.totals.tokensOut)} out`);
+  kv('Accounts', `${stats.totals.activeAccounts}/${stats.totals.accounts} enabled${stats.totals.cooling != null ? c.gray(`, ${stats.totals.cooling} cooling`) : ''}`);
+  kv('Uptime', humanDuration(stats.uptimeMs));
+  kv('This minute', `${stats.minute.count} requests, ${humanNumber(stats.minute.tokens)} tokens`);
+  kv('Last hour', `${humanNumber(stats.lastHour.requests)} requests ${c.gray(`(${stats.lastHour.fail} failed, ${humanNumber(stats.lastHour.tokens)} tokens)`)}`);
+  if (stats.recentLatencyMs != null) kv('Avg latency', `${stats.recentLatencyMs} ms`);
+  kv('Memory', humanBytes(stats.memory.rss));
+  kv('Routing', `${stats.routing.mode}, ${stats.routing.maxRetries} retries`);
+  if (stats.providers && stats.providers.length) {
+    heading('By provider');
+    table(
+      ['PROVIDER', 'ACCOUNTS', 'REQUESTS', 'FAILED', 'TOKENS IN', 'TOKENS OUT'],
+      stats.providers.map((p) => [p.label, `${p.active}/${p.accounts}`, humanNumber(p.requests), String(p.fail), humanNumber(p.tokensIn), humanNumber(p.tokensOut)]),
+    );
+  }
+  blank();
+}
+
+async function cmdRequests(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  if (!up) die('Server is not running, request log is only served by the live API.');
+  const limit = Number(flags.limit || 30);
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (flags.errors) qs.set('errors', '1');
+  if (flags.provider) qs.set('provider', flags.provider);
+  const res = await api(store, 'GET', `/admin/logs?${qs}`);
+  heading(`Request log (latest ${res.data.length})`);
+  if (!res.data.length) {
+    info('No requests yet. Send one: blue test');
+    blank();
+    return;
+  }
+  table(
+    ['TIME', 'PROVIDER', 'ACCOUNT', 'MODEL', 'STATUS', 'MS', 'TOKENS', 'RETRY'],
+    res.data.map((l) => [
+      c.gray(String(l.ts).slice(11, 19)),
+      l.provider,
+      String(l.account || '—').slice(0, 16),
+      String(l.model || '—').slice(0, 26),
+      l.ok ? c.green(l.status) : c.red(l.status),
+      String(l.ms != null ? l.ms : '—'),
+      `${humanNumber((l.tokensIn || 0) + (l.tokensOut || 0))}`,
+      l.retries ? c.yellow(String(l.retries)) : c.gray('0'),
+    ]),
+  );
+  if (flags.errors) info('Showing failures only.');
+  blank();
+}
+
+async function cmdToken(flags) {
+  const store = openStore(flags);
+  const cfg = store.get();
+  out(cfg.clientKey);
+}
+
+async function cmdRotate(flags) {
+  const store = openStore(flags);
+  const up = await serverUp(store);
+  let key;
+  if (up) {
+    key = (await api(store, 'POST', '/admin/rotate-client-key')).clientKey;
+  } else {
+    store.get().clientKey = newSecret('blue_');
+    store.save();
+    key = store.get().clientKey;
+  }
+  heading('New client API key');
+  out(`  ${c.green(key)}`);
+  blank();
+  warn('Update your apps — the old key stops working immediately.');
+  blank();
+}
+
+async function cmdRestart(flags) {
+  if (!svc.unitExists()) die('Service not installed. Run sudo blue install.');
+  cmdService('restart');
+}
+
+function cmdOpen(flags) {
+  const store = openStore(flags);
+  const port = store.get().port || 1212;
+  heading('Open the dashboard');
+  out(`  ${c.bold(`http://${lanIp()}:${port}/#token=${store.get().adminToken}`)}`);
+  blank();
+  info('Paste the admin token in the dashboard login if the link does not carry it.');
+  blank();
+}
+
+async function cmdUpdate(flags) {
+  if (!fs.existsSync(path.join(ROOT, '.git'))) die('Not a git checkout — update manually.');
+  heading('Updating BlueRouter');
+  try {
+    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).trim();
+    const outText = execFileSync('git', ['pull', '--ff-only', 'origin', branch], { cwd: ROOT, encoding: 'utf8' });
+    out(`  ${c.gray(outText.trim())}`);
+    ok(`Updated on branch ${branch}`);
+  } catch (err) {
+    warn(`git pull failed: ${(err.stderr || err.message || '').toString().trim()}`);
+    info('Resolve it manually, then run: sudo blue restart');
+    return;
+  }
+  if (svc.unitExists() && !flags['no-restart']) {
+    cmdService('restart');
+  } else {
+    info('Restart manually: sudo blue restart (or blue start)');
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Help                                                                */
+/* ------------------------------------------------------------------ */
+
+function printHelp() {
+  const ip = lanIp();
+  blank();
+  out(c.bold('  BlueRouter') + c.gray(`  v${pkg.version}  —  one API for all your AI accounts`));
+  blank();
+  out(`  ${c.gray('Use:')} ${c.bold('blue <command> [options]')}   ${c.gray(`(default port ${openStore().get().port || 1212}, dashboard http://${ip}:${openStore().get().port || 1212})`)}`);
+  const sections = {
+    'Server (systemd)': [
+      ['install', 'install + start on this VPS (sudo), --port 1212'],
+      ['uninstall', 'stop + remove service (add --purge to delete data)'],
+      ['status', 'service, accounts, traffic — everything (--json)'],
+      ['start / stop / restart', 'manual control'],
+      ['enable / disable', 'auto-start on boot on/off'],
+      ['logs', 'service log (-f to follow)'],
+      ['update', 'git pull + restart'],
+    ],
+    Accounts: [
+      ['add <provider> <key…>', 'register one or many API keys'],
+      ['keys [provider]', 'list accounts, health and usage'],
+      ['rm <id>', 'remove an account'],
+      ['enable / disable <id>', 'take an account in or out of rotation'],
+      ['rename <id> <name>', 'label an account (e.g. "groq-2")'],
+      ['check [id|all]', 'call the provider to verify keys'],
+      ['reset', 'clear all cooldowns'],
+      ['url / token / rotate', 'show URLs, API key, rotate client key'],
+    ],
+    'Providers & traffic': [
+      ['providers', 'catalog, free-tier limits, account counts'],
+      ['provider set <id> <f> <v>', 'enabled / baseUrl / protocol / models'],
+      ['models', 'live model list across your accounts'],
+      ['test', 'send a real chat request end-to-end'],
+      ['stats', 'requests, tokens, latency'],
+      ['requests', 'recent request log (--errors, --limit)'],
+      ['config [get|set]', 'read or change settings'],
+    ],
+  };
+  for (const [title, items] of Object.entries(sections)) {
+    blank();
+    out(`  ${c.bold(title)}`);
+    for (const [cmd, desc] of items) {
+      out(`    ${c.cyan(pad(cmd, 26))} ${c.gray(desc)}`);
+    }
+  }
+  blank();
+  out(`  ${c.gray('Quick start:')}  sudo blue install  →  blue add groq <API_KEY>  →  blue check  →  blue test`);
+  blank();
+}
+
+/* ------------------------------------------------------------------ */
+/* Router                                                              */
+/* ------------------------------------------------------------------ */
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const { flags, positional } = parseArgs(argv);
+  const cmd = (positional[0] || '').toLowerCase();
+
+  if (flags.version || cmd === 'version' || cmd === '--version') {
+    out(pkg.version);
+    return;
+  }
+  if (flags.help && !cmd) return printHelp();
+  if (!cmd) return printHelp();
+
+  switch (cmd) {
+    case 'install':
+    case 'setup':
+      return cmdInstall(flags);
+    case 'uninstall':
+    case 'remove-all':
+      return cmdUninstall(flags);
+    case 'status':
+    case 'st':
+      return cmdStatus(flags);
+    case 'start':
+      return cmdStart(flags);
+    case 'stop':
+      return cmdService('stop');
+    case 'restart':
+      return cmdRestart(flags);
+    case 'enable':
+      if (!positional[1]) return cmdService('enable');
+      return cmdToggle(flags, positional, true);
+    case 'disable':
+      if (!positional[1]) return cmdService('disable');
+      return cmdToggle(flags, positional, false);
+    case 'logs':
+    case 'log':
+      return cmdLogs(flags);
+    case 'update':
+    case 'upgrade':
+      return cmdUpdate(flags);
+    case 'add':
+    case 'add-key':
+      return cmdAdd(flags, positional);
+    case 'keys':
+    case 'ls':
+    case 'list':
+      return cmdKeys(flags, positional);
+    case 'rm':
+    case 'remove':
+    case 'delete':
+      return cmdRm(flags, positional);
+    case 'rename':
+      return cmdRename(flags, positional);
+    case 'check':
+    case 'health':
+      return cmdCheck(flags, positional);
+    case 'reset':
+    case 'clear-cooldowns':
+      return cmdReset(flags);
+    case 'test':
+      return cmdTest(flags);
+    case 'providers':
+      return cmdProviders(flags);
+    case 'provider':
+      if (positional[1] === 'set') return cmdProviderSet(flags, positional);
+      return cmdProviders(flags);
+    case 'models':
+      return cmdModels(flags);
+    case 'config':
+      return cmdConfig(flags, positional);
+    case 'url':
+    case 'urls':
+      return cmdUrls(flags);
+    case 'token':
+    case 'key':
+      return cmdToken(flags);
+    case 'rotate':
+      return cmdRotate(flags);
+    case 'stats':
+    case 'usage':
+      return cmdStats(flags);
+    case 'requests':
+    case 'reqs':
+      return cmdRequests(flags);
+    case 'open':
+    case 'dashboard':
+      return cmdOpen(flags);
+    case 'help':
+    case '-h':
+      return printHelp();
+    default:
+      blank();
+      out(`  ${c.red('✖')} Unknown command: ${c.bold(cmd)}`);
+      out(`  ${c.gray('Run')} ${c.bold('blue help')} ${c.gray('to see all commands.')}`);
+      blank();
+      process.exitCode = 1;
+  }
+}
+
+main().catch((err) => {
+  if (process.env.DEBUG) console.error(err);
+  blank();
+  out(`  ${c.red('✖')} ${err && err.message ? err.message : err}`);
+  blank();
+  process.exit(1);
+});

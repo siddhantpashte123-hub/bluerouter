@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+.env
+*.local
+data/
+.demo/
+tmp/
+coverage/
+*.log
+!docs/*.log
