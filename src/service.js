@@ -1,13 +1,18 @@
 'use strict';
 
 /**
- * systemd integration — install / remove / inspect the BlueRouter service.
- * Only used by the `blue install`, `blue uninstall` and service commands.
+ * Service management — install / remove / inspect the BlueRouter service.
+ *
+ * Two modes:
+ *   systemd     best on a normal VPS: auto-restart, auto-start on boot, journald
+ *   background  anywhere else (Docker, GitHub Codespaces, LXC, WSL, shared
+ *               hosting without systemd): detached node process + PID file +
+ *               log file. No root needed, but no boot-supervision either.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 
 const UNIT_NAME = 'bluerouter';
 const UNIT_PATH = `/etc/systemd/system/${UNIT_NAME}.service`;
@@ -129,6 +134,224 @@ function followJournal() {
   return child.status;
 }
 
+/* ------------------------------------------------------------------ */
+/* Background mode (no systemd)                                        */
+/* ------------------------------------------------------------------ */
+
+const RUN_FILE = 'run.json';          // pid of the running process (while running)
+const INSTALL_FILE = 'service.json';  // remembers the installed mode (until uninstall)
+const LOG_DIR = 'logs';
+const LOG_FILE = 'bluerouter.log';
+
+function runFile(dataDir) {
+  return path.join(dataDir, RUN_FILE);
+}
+
+function installFile(dataDir) {
+  return path.join(dataDir, INSTALL_FILE);
+}
+
+function readServiceRecord(dataDir) {
+  try {
+    return JSON.parse(fs.readFileSync(installFile(dataDir), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeServiceRecord(dataDir, record) {
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(installFile(dataDir), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  return installFile(dataDir);
+}
+
+function removeServiceRecord(dataDir) {
+  try {
+    fs.unlinkSync(installFile(dataDir));
+  } catch { /* already gone */ }
+}
+
+function logFile(dataDir) {
+  return path.join(dataDir, LOG_DIR, LOG_FILE);
+}
+
+function readRun(dataDir) {
+  try {
+    return JSON.parse(fs.readFileSync(runFile(dataDir), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function pidAlive(pid) {
+  if (!pid || !Number.isInteger(Number(pid))) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/** Is this pid a BlueRouter server? Guards against recycled pids. */
+function looksLikeBlueRouter(pid) {
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    return /server\.js/.test(cmdline);
+  } catch {
+    return true; // /proc not available (macOS) — trust the pid file
+  }
+}
+
+function backgroundStatus(dataDir) {
+  const record = readServiceRecord(dataDir);
+  const run = readRun(dataDir);
+  if (!run || !pidAlive(run.pid) || !looksLikeBlueRouter(run.pid)) {
+    return {
+      mode: 'background',
+      installed: !!record,
+      active: false,
+      enabled: false,
+      pid: null,
+      since: record && record.installedAt ? Date.parse(record.installedAt) : null,
+      port: (record && record.port) || (run ? run.port : null),
+      logPath: logFile(dataDir),
+      state: record ? 'stopped' : 'not installed',
+    };
+  }
+  return {
+    mode: 'background',
+    installed: true,
+    active: true,
+    enabled: false,
+    pid: run.pid,
+    since: run.startedAt ? Date.parse(run.startedAt) : null,
+    port: run.port,
+    logPath: logFile(dataDir),
+    state: 'running',
+  };
+}
+
+function backgroundStart({ repoDir, dataDir, nodeBin, port }) {
+  const existing = backgroundStatus(dataDir);
+  if (existing.active) {
+    return { ok: true, already: true, pid: existing.pid };
+  }
+  fs.mkdirSync(path.join(dataDir, LOG_DIR), { recursive: true, mode: 0o700 });
+  const log = logFile(dataDir);
+  const fd = fs.openSync(log, 'a', 0o600);
+  const child = spawn(nodeBin, [path.join(repoDir, 'src', 'server.js')], {
+    cwd: repoDir,
+    detached: true,
+    stdio: ['ignore', fd, fd],
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      BLUEROUTER_DATA: dataDir,
+      PORT: String(port),
+    },
+  });
+  child.unref();
+  fs.closeSync(fd);
+  if (!readServiceRecord(dataDir)) {
+    writeServiceRecord(dataDir, {
+      mode: 'background',
+      port,
+      repoDir,
+      nodeBin,
+      dataDir,
+      installedAt: new Date().toISOString(),
+    });
+  }
+  const run = {
+    mode: 'background',
+    pid: child.pid,
+    port,
+    nodeBin,
+    repoDir,
+    dataDir,
+    logPath: log,
+    startedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(runFile(dataDir), `${JSON.stringify(run, null, 2)}\n`, { mode: 0o600 });
+  return { ok: true, pid: child.pid, logPath: log };
+}
+
+function backgroundStop(dataDir, { quiet = false } = {}) {
+  const run = readRun(dataDir);
+  if (!run || !pidAlive(run.pid)) {
+    try {
+      fs.unlinkSync(runFile(dataDir));
+    } catch { /* nothing to clean */ }
+    return { ok: true, already: true };
+  }
+  const pid = Number(run.pid);
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err) {
+    if (err.code !== 'ESRCH') return { ok: false, err: err.message };
+  }
+  // wait up to ~6s for a clean exit
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid) || !looksLikeBlueRouter(pid)) break;
+    try {
+      execFileSync('sleep', ['0.15'], { stdio: 'ignore' });
+    } catch { /* ignore */ }
+  }
+  if (pidAlive(pid) && looksLikeBlueRouter(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch { /* already gone */ }
+  }
+  try {
+    fs.unlinkSync(runFile(dataDir));
+  } catch { /* ignore */ }
+  if (!quiet) {
+    // give the OS a moment to release the port
+    try {
+      execFileSync('sleep', ['0.2'], { stdio: 'ignore' });
+    } catch { /* ignore */ }
+  }
+  return { ok: true, stopped: pid };
+}
+
+function backgroundLogs(dataDir, n = 60) {
+  const file = logFile(dataDir);
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const lines = raw.split('\n');
+    return lines.slice(Math.max(0, lines.length - n - 1)).join('\n').replace(/\s+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function followBackgroundLog(dataDir) {
+  const file = logFile(dataDir);
+  if (!fs.existsSync(file)) return 1;
+  const child = spawnSync('tail', ['-f', '-n', '40', file], { stdio: 'inherit' });
+  return child.status;
+}
+
+/* ------------------------------------------------------------------ */
+/* Unified interface                                                   */
+/* ------------------------------------------------------------------ */
+
+/** 'systemd' | 'background' — what is installed on this machine for this data dir. */
+function mode(dataDir) {
+  if (unitExists()) return 'systemd';
+  const record = readServiceRecord(dataDir);
+  if (record && record.mode) return record.mode;
+  return null;
+}
+
+/** One status object regardless of the mode. */
+function statusOf(dataDir) {
+  if (unitExists()) return { ...status(), mode: 'systemd', logPath: null };
+  return backgroundStatus(dataDir);
+}
+
 /** Probe a local BlueRouter instance. */
 async function probe(port, timeoutMs = 900) {
   const ctrl = new AbortController();
@@ -166,4 +389,23 @@ module.exports = {
   followJournal,
   probe,
   run,
+  // background mode
+  RUN_FILE,
+  INSTALL_FILE,
+  runFile,
+  installFile,
+  logFile,
+  readServiceRecord,
+  writeServiceRecord,
+  removeServiceRecord,
+  readRun,
+  pidAlive,
+  backgroundStatus,
+  backgroundStart,
+  backgroundStop,
+  backgroundLogs,
+  followBackgroundLog,
+  // unified
+  mode,
+  statusOf,
 };

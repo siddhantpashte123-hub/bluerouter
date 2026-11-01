@@ -8,6 +8,7 @@
 #   --port <n>       port to listen on (default 1212)
 #   --dir <path>     where to put the code (default /opt/bluerouter)
 #   --branch <name>  git branch to install (default main)
+#   --background     force background mode (no systemd needed)
 #   --no-color       plain output
 #
 set -euo pipefail
@@ -35,6 +36,7 @@ while [ $# -gt 0 ]; do
     --port)   PORT="${2:?--port needs a value}"; shift 2 ;;
     --dir)    TARGET_DIR="${2:?--dir needs a value}"; shift 2 ;;
     --branch) BRANCH="${2:?--branch needs a value}"; shift 2 ;;
+    --background) SERVICE_MODE="background"; shift ;;
     --no-color) B=""; G=""; Y=""; R=""; D=""; N=""; shift ;;
     -h|--help)
       sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
@@ -51,11 +53,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ------------------------------------------------------------------ os
-if ! command -v systemctl >/dev/null 2>&1; then
-  die "systemd not found. BlueRouter installs as a systemd service. Use a normal VPS (Ubuntu/Debian/Fedora)."
-fi
-if [ ! -d /run/systemd/system ]; then
-  warn "systemd does not look active right now — the service may not start until you boot the VPS normally."
+SERVICE_MODE="auto"
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+  SERVICE_MODE="background"
+  warn "systemd not available here (container / Codespace / WSL)."
+  say  "→ installing as a background process instead (no auto-start on boot)."
 fi
 
 # ------------------------------------------------------------------ deps
@@ -136,6 +138,10 @@ fi
 step "4/4  Service"
 cd "$TARGET_DIR"
 chmod +x bin/blue
-node bin/blue install --port "$PORT"
+if [ "$SERVICE_MODE" = "background" ]; then
+  node bin/blue install --background --port "$PORT"
+else
+  node bin/blue install --port "$PORT"
+fi
 
 printf "\n${G}  Done.${N} Next:  ${B}blue add groq <API_KEY>${N}  →  ${B}blue check${N}  →  ${B}blue test${N}\n\n"

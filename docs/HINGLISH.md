@@ -60,6 +60,27 @@ blue status
 
 Output me `running` dikhna chahiye.
 
+### Codespace / Docker / WSL me systemd nahi hota
+
+Agar aap **GitHub Codespace, Docker, WSL ya kisi LXC** me ho, wahan systemd
+nahi hota — script khud detect kar leti hai aur **background mode** me install
+kar deti hai:
+
+```bash
+sudo ./install.sh              # khud fallback karega
+blue install --background      # ya manually force karo (root ki zarurat nahi)
+```
+
+Background mode me:
+- process peeche chal padta hai, PID `data/run.json` me, log `data/logs/bluerouter.log` me
+- `blue status / stop / start / restart / logs -f` — sab same tarah chalte hain
+- **reboot par khud start nahi hoga** (ye sirf systemd deta hai) → permanent ke liye asli VPS lo
+- Codespaces me install ke baad public URL bhi print hota hai, jaise
+  `https://<codespace-name>-1212.app.github.dev` — Ports tab me port ko **Public** kar dena
+
+Error `systemd not found on this machine` aata hai to matlab: `--background`
+flag se chalana hai (ya asli VPS use karna hai).
+
 ---
 
 ## 3. Apne 5 Groq accounts add karo
@@ -235,6 +256,7 @@ blue reset                     # cooldowns clear
 blue rotate                    # nayi client API key
 blue logs -f                   # live server log
 blue update                    # update + restart
+blue logs -f                   # live log (systemd: journald, warna log file)
 sudo blue uninstall            # service hatao (data safe rehta hai)
 sudo blue uninstall --purge --yes   # sab kuch delete
 ```
@@ -260,6 +282,7 @@ blue rm acc_xxxxxxxx
 | --- | --- |
 | Dashboard nahi khul raha | `blue status` chalao; firewall me `ufw allow 1212/tcp`; VPS panel me bhi port kholo |
 | `blue install` bola "sudo" | `sudo blue install` ya `sudo ./install.sh` |
+| `systemd not found on this machine` | `blue install --background` (Codespace/Docker/WSL me systemd nahi hota) |
 | Sab accounts `rate limited` | `blue reset` karo; ya doosre provider ki key add karo (`blue providers`) |
 | `invalid key` | Provider dashboard se key check karo — galat/expired hai |
 | `No accounts configured` | `blue add groq <key>` |
