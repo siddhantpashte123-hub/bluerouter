@@ -81,6 +81,14 @@ Background mode me:
 Error `systemd not found on this machine` aata hai to matlab: `--background`
 flag se chalana hai (ya asli VPS use karna hai).
 
+Agar installer bole **"The code in /opt/bluerouter is older than this
+installer"** — matlab pehle se pada `/opt/bluerouter` purane branch par hai.
+Us branch ke saath dobara chalao:
+
+```bash
+curl -fsSL <install.sh ka url> | sudo bash -s -- --branch <branch-name>
+```
+
 ---
 
 ## 3. Apne 5 Groq accounts add karo

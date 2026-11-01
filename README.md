@@ -73,6 +73,14 @@ blue stop / start / restart    # work in both modes
 sudo blue uninstall --yes      # or without sudo in background mode
 ```
 
+If `/opt/bluerouter` already exists on an older branch (for example right after
+an update that has not been merged yet), the installer stops with a clear
+message instead of a confusing failure. Point it at the branch you want:
+
+```bash
+... | sudo bash -s -- --branch <branch-name>
+```
+
 Background mode does **not** restart by itself after a reboot or a crash — that
 is only what systemd gives you. Use it for testing, containers, and short-lived
 boxes; use a real VPS (or run the process under your own supervisor) for
@@ -370,7 +378,7 @@ git clone https://github.com/siddhantpashte123-hub/bluerouter.git
 cd bluerouter
 npm test              # 26 end-to-end routing tests against a fake provider
 npm run test:cli      # 26 CLI tests, real binary + live server
-npm run test:service  # 14 background-mode install/stop/start/uninstall tests
+npm run test:service  # 15 background-mode install/stop/start/uninstall tests
 npm install --no-save jsdom && npm run test:ui   # 14 dashboard tests in jsdom
 npm run demo          # fake provider + seeded dashboard on http://127.0.0.1:1212
 PORT=1212 BLUEROUTER_DATA=./data node src/server.js

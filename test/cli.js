@@ -94,11 +94,12 @@ function mockServer() {
     assert.match(r.out, /blue add groq/);
   });
 
-  await check('install --systemd refuses to run without root', async () => {
+  await check('install --systemd refuses when systemd is unusable / no root', async () => {
     if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root: nothing to refuse
     const r = await run(['install', '--systemd', '--port', String(PORT)]);
     assert.strictEqual(r.code, 1, r.out);
-    assert.match(r.out, /sudo blue install/);
+    // either "systemd is not running" (no usable systemd) or "needs root"
+    assert.match(r.out, /systemd is not running|sudo blue install/i);
   });
 
   await check('install --systemd explains when systemd is missing', async () => {

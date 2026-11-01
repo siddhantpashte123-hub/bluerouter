@@ -416,6 +416,14 @@ async function cmdInstall(flags) {
   // ---- 2. install + start --------------------------------------
   if (mode === 'systemd') {
     svc.writeUnit({ repoDir: ROOT, dataDir, nodeBin: process.execPath, port });
+    svc.writeServiceRecord(dataDir, {
+      mode: 'systemd',
+      port,
+      repoDir: ROOT,
+      nodeBin: process.execPath,
+      dataDir,
+      installedAt: new Date().toISOString(),
+    });
     svc.daemonReload();
     svc.enable();
     const started = svc.restart();
@@ -440,10 +448,22 @@ async function cmdInstall(flags) {
   }
   if (!health) {
     blank();
-    warn('Service did not answer on /health. Last log lines:');
+    const logText = serviceLogs(dataDir, 40) || '';
+    warn('The service did not answer on /health. Last log lines:');
     blank();
-    out(serviceLogs(dataDir, 30) || c.gray('  (no log yet)'));
-    die(`Install finished but the server is not responding.\n  Port ${port} may already be in use — try: blue install --port 1213\n  Logs: ${c.bold('blue logs')}`);
+    out(logText || c.gray('  (no log yet)'));
+    if (mode === 'systemd') {
+      const info = svc.failureInfo();
+      if (info) out(`  ${c.gray('systemd:')} ${info}`);
+    }
+    blank();
+    if (/EADDRINUSE|address already in use/i.test(logText)) {
+      die(`Port ${port} is already in use. Free it, or install on another port: ${c.bold(`blue install --port ${port + 1}`)}`);
+    }
+    if (/NAMESPACE|status=226/i.test(logText)) {
+      die(`systemd could not start the process (namespace/permissions).\n  Try background mode instead: ${c.bold('blue install --background')}`);
+    }
+    die(`Server is not responding.\n  Logs: ${c.bold('blue logs')}${mode === 'background' ? c.gray(`  (file: ${svc.logFile(dataDir)})`) : ''}`);
   }
 
   // ---- 4. report ------------------------------------------------
@@ -522,20 +542,21 @@ async function cmdUninstall(flags) {
   kv('Mode', modeLabel(state.mode));
   kv('Data (kept)', dataDir);
 
-  if (state.mode === 'systemd') {
+  if (svc.unitExists()) {
     const stopped = svc.stop();
-    if (stopped.ok) ok('Service stopped');
+    if (stopped.ok) ok('systemd service stopped');
     svc.disable();
     svc.removeUnit();
     svc.daemonReload();
     ok(`Removed ${svc.UNIT_PATH}`);
-  } else {
-    const stopped = svc.backgroundStop(dataDir);
-    if (stopped.ok) ok(stopped.stopped ? `Stopped process ${stopped.stopped}` : 'Nothing was running');
-    else warn(`Could not stop the process: ${stopped.err}`);
-    svc.removeServiceRecord(dataDir);
-    ok(`Removed ${svc.installFile(dataDir)}`);
   }
+  if (state.mode === 'background' || svc.readRun(dataDir)) {
+    const stopped = svc.backgroundStop(dataDir);
+    if (stopped.ok) ok(stopped.stopped ? `Stopped background process ${stopped.stopped}` : 'No background process was running');
+    else warn(`Could not stop the background process: ${stopped.err}`);
+  }
+  svc.removeServiceRecord(dataDir);
+  ok(`Removed ${svc.installFile(dataDir)}`);
 
   try {
     const link = '/usr/local/bin/blue';

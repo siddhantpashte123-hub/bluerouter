@@ -7,8 +7,9 @@
 # Options:
 #   --port <n>       port to listen on (default 1212)
 #   --dir <path>     where to put the code (default /opt/bluerouter)
-#   --branch <name>  git branch to install (default main)
+#   --branch <name>  git branch to install (default main, or $BLUEROUTER_BRANCH)
 #   --background     force background mode (no systemd needed)
+#   --systemd        force systemd mode (fails if systemd is unusable)
 #   --no-color       plain output
 #
 set -euo pipefail
@@ -16,7 +17,8 @@ set -euo pipefail
 REPO_URL="https://github.com/siddhantpashte123-hub/bluerouter.git"
 PORT="1212"
 TARGET_DIR="/opt/bluerouter"
-BRANCH="main"
+BRANCH="${BLUEROUTER_BRANCH:-main}"
+SERVICE_MODE="auto"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -37,9 +39,10 @@ while [ $# -gt 0 ]; do
     --dir)    TARGET_DIR="${2:?--dir needs a value}"; shift 2 ;;
     --branch) BRANCH="${2:?--branch needs a value}"; shift 2 ;;
     --background) SERVICE_MODE="background"; shift ;;
+    --systemd)    SERVICE_MODE="systemd"; shift ;;
     --no-color) B=""; G=""; Y=""; R=""; D=""; N=""; shift ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -53,11 +56,29 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ------------------------------------------------------------------ os
-SERVICE_MODE="auto"
-if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
-  SERVICE_MODE="background"
-  warn "systemd not available here (container / Codespace / WSL)."
-  say  "→ installing as a background process instead (no auto-start on boot)."
+systemd_usable() {
+  [ -d /run/systemd/system ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  state="$(systemctl is-system-running 2>&1 || true)"
+  case "$state" in
+    running|degraded|starting|initializing|maintenance*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$SERVICE_MODE" = "auto" ]; then
+  if systemd_usable; then
+    SERVICE_MODE="systemd"
+  else
+    SERVICE_MODE="background"
+    warn "systemd is not usable here (container / Codespace / WSL / no bus)."
+    say  "→ installing as a background process instead (no auto-start on boot)."
+  fi
+elif [ "$SERVICE_MODE" = "systemd" ]; then
+  systemd_usable || die "--systemd was requested but systemd is not usable on this machine.
+  Drop the flag (auto) or use --background."
+else
+  say "background mode requested — no systemd service will be installed."
 fi
 
 # ------------------------------------------------------------------ deps
@@ -123,15 +144,33 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/package.json" ] && [ -f "$SCRIPT_DI
   TARGET_DIR="$SCRIPT_DIR"
   ok "using this checkout: $TARGET_DIR"
 elif [ -d "$TARGET_DIR/.git" ]; then
-  git -C "$TARGET_DIR" fetch --quiet origin "$BRANCH"
-  git -C "$TARGET_DIR" checkout --quiet "$BRANCH"
-  git -C "$TARGET_DIR" pull --quiet --ff-only origin "$BRANCH"
-  ok "updated $TARGET_DIR ($BRANCH)"
+  git -C "$TARGET_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
+  git -C "$TARGET_DIR" fetch --quiet origin "$BRANCH" \
+    || die "git fetch failed (branch '$BRANCH'?) — is the network up and the repo accessible?"
+  if git -C "$TARGET_DIR" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; then
+    git -C "$TARGET_DIR" checkout --quiet -f "$BRANCH"
+  else
+    git -C "$TARGET_DIR" checkout --quiet -f -B "$BRANCH" "origin/$BRANCH"
+  fi
+  git -C "$TARGET_DIR" reset --quiet --hard "origin/$BRANCH"
+  ok "updated $TARGET_DIR → $BRANCH ($(git -C "$TARGET_DIR" rev-parse --short HEAD))"
 else
   mkdir -p "$(dirname "$TARGET_DIR")"
   git clone --quiet --branch "$BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR" \
     || die "git clone failed. Is the repository public / is the network up?"
-  ok "cloned into $TARGET_DIR"
+  ok "cloned into $TARGET_DIR ($BRANCH)"
+fi
+
+# The installer and the code must match: an older checkout (e.g. an /opt copy
+# still on main) would ignore --background and fail with "systemd not found".
+if [ "$SERVICE_MODE" = "background" ] && ! grep -q -- "--background" "$TARGET_DIR/bin/blue" 2>/dev/null; then
+  installed_branch="$(git -C "$TARGET_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  printf "\n  ${R}✖${N} The code in %s is older than this installer:\n" "$TARGET_DIR"
+  printf "    branch %s%s%s has no systemd-free install support.\n\n" "$B" "$installed_branch" "$N"
+  printf "  Fix it with either of these:\n"
+  printf "    • install the newer branch:   ${B}... | sudo bash -s -- --branch <branch-name>${N}\n"
+  printf "    • or update that checkout:    ${B}git -C %s fetch && git -C %s checkout <branch>${N}\n\n" "$TARGET_DIR" "$TARGET_DIR"
+  exit 1
 fi
 
 # ------------------------------------------------------------------ install

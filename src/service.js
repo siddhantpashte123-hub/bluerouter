@@ -21,10 +21,23 @@ function isRoot() {
   return typeof process.getuid === 'function' && process.getuid() === 0;
 }
 
+/**
+ * systemd must be *usable*, not merely present: containers often ship the
+ * `systemctl` binary and even /run/systemd/system, yet PID 1 is not systemd
+ * (or its bus socket is missing), so every systemctl call fails with
+ * "Failed to connect to bus".
+ */
 function systemdAvailable() {
   if (!fs.existsSync('/run/systemd/system')) return false;
-  const found = spawnSync('sh', ['-c', 'command -v systemctl'], { encoding: 'utf8' });
-  return found.status === 0;
+  const found = spawnSync('sh', ['-c', 'command -v systemctl'], { encoding: 'utf8', timeout: 3000 });
+  if (found.status !== 0) return false;
+  const res = spawnSync('systemctl', ['is-system-running'], { encoding: 'utf8', timeout: 5000 });
+  if (res.error) return false;
+  const out = `${res.stdout || ''}${res.stderr || ''}`.trim().toLowerCase();
+  if (!out) return false;
+  if (/failed to connect|not running|offline|no such file|no medium found|bus:/i.test(out)) return false;
+  if (res.status === 0) return true;
+  return /^(running|degraded|starting|initializing|maintenance)/.test(out);
 }
 
 function unitExists() {
@@ -32,6 +45,17 @@ function unitExists() {
 }
 
 function unitText({ repoDir, dataDir, nodeBin, port }) {
+  // Hardening that would break a data dir inside /tmp: PrivateTmp gives the
+  // service its own /tmp, and ReadWritePaths on a private tmp fails with
+  // status=226/NAMESPACE. Only add those when the data dir is elsewhere.
+  const inTmp = /^\/(tmp|var\/tmp|dev\/shm)(\/|$)/.test(dataDir);
+  const hardening = [
+    'NoNewPrivileges=true',
+    'ProtectSystem=full',
+    'ProtectHome=false',
+    ...(inTmp ? [] : ['PrivateTmp=true', `ReadWritePaths=${dataDir}`]),
+  ].join('\n');
+
   return `[Unit]
 Description=BlueRouter — one API for all AI accounts
 Documentation=https://github.com/siddhantpashte123-hub/bluerouter
@@ -50,11 +74,7 @@ RestartSec=3
 TimeoutStopSec=15
 KillSignal=SIGTERM
 LimitNOFILE=65535
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=false
-ReadWritePaths=${dataDir}
+${hardening}
 
 [Install]
 WantedBy=multi-user.target
@@ -124,9 +144,33 @@ function restart() { return systemctl('restart', UNIT_NAME); }
 function enable() { return systemctl('enable', UNIT_NAME); }
 function disable() { return systemctl('disable', UNIT_NAME); }
 
+function journal(...args) {
+  try {
+    return { ok: true, out: run('journalctl', args) };
+  } catch (err) {
+    return {
+      ok: false,
+      out: (err.stdout || '').toString().trim(),
+      err: (err.stderr || err.message || '').toString().trim(),
+    };
+  }
+}
+
+/** What systemd thinks went wrong (empty when the unit is healthy). */
+function failureInfo() {
+  const res = systemctl('show', UNIT_NAME, '-p', 'Result', '-p', 'ExecMainStatus', '-p', 'NRestarts', '--value');
+  if (!res.ok) return res.err || res.out || '';
+  const [result, status, restarts] = (res.out || '').split('\n');
+  const bits = [];
+  if (result && result !== 'success') bits.push(`Result=${result}`);
+  if (status && status !== '0') bits.push(`ExitCode=${status}`);
+  if (restarts && restarts !== '0') bits.push(`Restarts=${restarts}`);
+  return bits.join(' ');
+}
+
 function journalLines(n = 60) {
-  const res = systemctl('-u', UNIT_NAME, '-n', String(n), '--no-pager', '--output', 'cat');
-  return res.out || res.err || '';
+  const res = journal('-u', UNIT_NAME, '-n', String(n), '--no-pager', '--output', 'cat');
+  return res.ok ? res.out : (res.err || res.out || '');
 }
 
 function followJournal() {
@@ -346,9 +390,19 @@ function mode(dataDir) {
   return null;
 }
 
-/** One status object regardless of the mode. */
+/**
+ * One status object regardless of the mode.
+ * The mode recorded at install time wins; a leftover unit file or a stale
+ * run.json from an earlier install must never change what we report.
+ */
 function statusOf(dataDir) {
-  if (unitExists()) return { ...status(), mode: 'systemd', logPath: null };
+  const record = readServiceRecord(dataDir);
+  const sysd = () => ({ ...status(), mode: 'systemd', logPath: null });
+  const notInstalled = { mode: record ? record.mode : 'background', installed: false, active: false, enabled: false, pid: null, state: 'not installed' };
+
+  if (record && record.mode === 'systemd') return unitExists() ? sysd() : notInstalled;
+  if (record && record.mode === 'background') return backgroundStatus(dataDir);
+  if (unitExists()) return sysd();
   return backgroundStatus(dataDir);
 }
 
@@ -386,6 +440,7 @@ module.exports = {
   enable,
   disable,
   journalLines,
+  failureInfo,
   followJournal,
   probe,
   run,

@@ -176,12 +176,24 @@ const health = () => fetch(`${BASE}/health`).then((r) => (r.ok ? r.json() : null
   await check('uninstall stops the process and removes the service record', async () => {
     const r = await run(['uninstall', '--yes']);
     assert.strictEqual(r.code, 0, r.out);
-    assert.match(r.out, /Stopped process|Nothing was running/);
+    assert.match(r.out, /Stopped (background )?process|No background process was running/);
     assert.ok(!fs.existsSync(path.join(DATA, 'service.json')));
     assert.strictEqual(await health(), null);
     const st = JSON.parse((await run(['status', '--json'])).stdout);
     assert.strictEqual(st.service.installed, false);
     assert.match(r.out, /accounts are still in/);
+  });
+
+  await check('a second install on a fresh data dir reports background mode', async () => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'bluerouter-svc-mode-'));
+    const r = await run(['install', '--background', '--port', String(PORT + 1)], { BLUEROUTER_DATA: other });
+    assert.strictEqual(r.code, 0, r.out);
+    const st = JSON.parse((await run(['status', '--json'], { BLUEROUTER_DATA: other })).stdout);
+    assert.strictEqual(st.service.mode, 'background');
+    assert.strictEqual(st.service.active, true);
+    const stop = await run(['uninstall', '--yes', '--purge'], { BLUEROUTER_DATA: other });
+    assert.strictEqual(stop.code, 0, stop.out);
+    assert.ok(!fs.existsSync(other));
   });
 
   await check('accounts survive uninstall (data kept)', async () => {
