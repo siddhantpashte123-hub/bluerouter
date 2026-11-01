@@ -1,0 +1,38 @@
+{
+  "name": "bluerouter",
+  "version": "1.0.0",
+  "description": "One API for all your AI accounts \u2014 a self-hosted OpenAI-compatible gateway with key rotation, failover and a live dashboard.",
+  "main": "src/server.js",
+  "bin": {
+    "blue": "bin/blue"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "test": "node test/smoke.js",
+    "test:cli": "node test/cli.js",
+    "test:ui": "node test/ui.js",
+    "test:all": "node test/smoke.js && node test/cli.js",
+    "demo": "node scripts/demo.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "api-gateway",
+    "openai",
+    "groq",
+    "load-balancer",
+    "key-rotation",
+    "llm-proxy",
+    "self-hosted"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/siddhantpashte123-hub/bluerouter.git"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}

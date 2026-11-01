@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>BlueRouter — one API for all AI accounts</title>
+  <meta name="description" content="One OpenAI-compatible API for every AI account you own. Self-hosted gateway with rotation and automatic failover.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+  <!-- ---------------------------------------------------------- login -->
+  <div class="login-view" id="login-view">
+    <div class="aurora"></div>
+    <form class="login-card" id="login-form" autocomplete="off">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 48 48" width="34" height="34"><path d="M24 4 42 14v20L24 44 6 34V14Z" fill="none" stroke="url(#lg)" stroke-width="2.6"/><circle cx="24" cy="16" r="3.4" fill="url(#lg)"/><circle cx="15" cy="32" r="3.4" fill="url(#lg)"/><circle cx="33" cy="32" r="3.4" fill="url(#lg)"/><path d="M24 19.4 15.8 28.9M24 19.4l8.2 9.5M18.4 32h11.2" stroke="url(#lg)" stroke-width="1.6" fill="none"/><defs><linearGradient id="lg" x1="6" y1="4" x2="42" y2="44"><stop stop-color="#5aa2ff"/><stop offset="1" stop-color="#37e0d8"/></linearGradient></defs></svg>
+        </span>
+        <span class="brand-name">Blue<span>Router</span></span>
+      </div>
+      <h1>Your gateway is private</h1>
+      <p class="muted">Paste the admin token from your server. Find it with <code>blue url</code> in the terminal.</p>
+      <label class="field">
+        <span>Admin token</span>
+        <input id="login-token" type="password" placeholder="blueadmin_…" spellcheck="false" autocomplete="current-password" required>
+      </label>
+      <button class="btn primary block" type="submit" id="login-btn">Open dashboard</button>
+      <p class="login-error" id="login-error" role="alert"></p>
+      <p class="login-foot">Keys are stored only on this machine — never sent anywhere else.</p>
+    </form>
+  </div>
+
+  <!-- ------------------------------------------------------------ app -->
+  <div class="shell" id="app-view" hidden>
+    <aside class="sidebar">
+      <div class="brand-row">
+        <span class="logo small" aria-hidden="true">
+          <svg viewBox="0 0 48 48" width="26" height="26"><path d="M24 4 42 14v20L24 44 6 34V14Z" fill="none" stroke="url(#lg2)" stroke-width="3"/><circle cx="24" cy="16" r="3.6" fill="url(#lg2)"/><circle cx="15" cy="32" r="3.6" fill="url(#lg2)"/><circle cx="33" cy="32" r="3.6" fill="url(#lg2)"/><path d="M24 19.6 15.8 28.9M24 19.6l8.2 9.3M18.6 32h10.8" stroke="url(#lg2)" stroke-width="1.8" fill="none"/><defs><linearGradient id="lg2" x1="6" y1="4" x2="42" y2="44"><stop stop-color="#5aa2ff"/><stop offset="1" stop-color="#37e0d8"/></linearGradient></defs></svg>
+        </span>
+        <div>
+          <div class="brand-name">Blue<span>Router</span></div>
+          <div class="brand-ver" id="side-version">v1.0.0</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-tab="overview"><span class="ico" data-icon="grid"></span>Overview</button>
+        <button class="nav-item" data-tab="accounts"><span class="ico" data-icon="key"></span>Accounts<span class="nav-badge" id="nav-accounts">0</span></button>
+        <button class="nav-item" data-tab="providers"><span class="ico" data-icon="cloud"></span>Providers</button>
+        <button class="nav-item" data-tab="playground"><span class="ico" data-icon="play"></span>Playground</button>
+        <button class="nav-item" data-tab="models"><span class="ico" data-icon="cpu"></span>Models</button>
+        <button class="nav-item" data-tab="logs"><span class="ico" data-icon="list"></span>Requests</button>
+        <button class="nav-item" data-tab="settings"><span class="ico" data-icon="gear"></span>Settings</button>
+      </nav>
+
+      <div class="side-foot">
+        <div class="gateway-pill" id="gateway-pill"><span class="dot"></span><span id="gateway-text">Connecting…</span></div>
+        <button class="btn ghost tiny block" id="logout-btn">Sign out</button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="title-block">
+          <h1 id="page-title">Overview</h1>
+          <p id="page-sub" class="muted">Everything at a glance</p>
+        </div>
+        <div class="top-actions">
+          <span class="pill live"><span class="dot"></span>live</span>
+          <button class="btn ghost" id="refresh-btn">Refresh</button>
+        </div>
+      </header>
+
+      <main class="content">
+
+        <!-- ------------------------------------------------- overview -->
+        <section class="tab" data-tab="overview">
+          <div class="hero" id="hero" hidden>
+            <div>
+              <h2>Add your first account</h2>
+              <p class="muted">BlueRouter turns every AI account you own into one OpenAI-compatible API. Add 2–3 keys and you get automatic rotation, failover and 3× the free limits.</p>
+            </div>
+            <button class="btn primary" data-goto="accounts">Add accounts</button>
+          </div>
+
+          <div class="stat-grid">
+            <article class="stat">
+              <span class="stat-label">Requests</span>
+              <strong id="ov-requests">0</strong>
+              <span class="stat-sub" id="ov-requests-sub">no traffic yet</span>
+            </article>
+            <article class="stat">
+              <span class="stat-label">Success rate</span>
+              <strong id="ov-success">—</strong>
+              <span class="stat-sub" id="ov-success-sub">—</span>
+            </article>
+            <article class="stat">
+              <span class="stat-label">Tokens</span>
+              <strong id="ov-tokens">0</strong>
+              <span class="stat-sub" id="ov-tokens-sub">in / out</span>
+            </article>
+            <article class="stat">
+              <span class="stat-label">Avg latency</span>
+              <strong id="ov-latency">—</strong>
+              <span class="stat-sub" id="ov-latency-sub">last requests</span>
+            </article>
+          </div>
+
+          <div class="grid-2">
+            <section class="panel">
+              <header class="panel-head">
+                <h2>Providers</h2>
+                <a class="link" data-goto="providers">Manage</a>
+              </header>
+              <div class="bars" id="ov-bars"></div>
+            </section>
+            <section class="panel">
+              <header class="panel-head">
+                <h2>Routing</h2>
+                <a class="link" data-goto="settings">Configure</a>
+              </header>
+              <dl class="kv" id="ov-routing"></dl>
+            </section>
+          </div>
+
+          <section class="panel">
+            <header class="panel-head">
+              <h2>Recent requests</h2>
+              <a class="link" data-goto="logs">View all</a>
+            </header>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr><th>Time</th><th>Provider</th><th>Account</th><th>Model</th><th>Status</th><th class="num">Latency</th><th class="num">Tokens</th></tr>
+                </thead>
+                <tbody id="ov-recent"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel endpoint-panel">
+            <header class="panel-head">
+              <h2>Your single API endpoint</h2>
+              <button class="btn tiny" data-copy="endpoint">Copy base URL</button>
+            </header>
+            <code class="endpoint" id="ov-endpoint">—</code>
+            <p class="muted">Use it with any OpenAI SDK or tool. One key, every account, automatic failover.</p>
+            <div class="code-row">
+              <pre id="ov-curl">—</pre>
+              <button class="btn tiny" data-copy="curl">Copy curl</button>
+            </div>
+          </section>
+        </section>
+
+        <!-- ------------------------------------------------- accounts -->
+        <section class="tab" data-tab="accounts" hidden>
+          <form class="panel add-panel" id="add-form">
+            <header class="panel-head">
+              <h2>Add accounts</h2>
+              <span class="muted">5 accounts = 5× the free limits, still one API key</span>
+            </header>
+            <div class="form-grid">
+              <label class="field">
+                <span>Provider</span>
+                <select id="add-provider"></select>
+              </label>
+              <label class="field">
+                <span>Name prefix <em>optional</em></span>
+                <input id="add-name" placeholder="groq-main" spellcheck="false">
+              </label>
+              <label class="field wide">
+                <span>API key(s) <em>one per line — paste as many as you want</em></span>
+                <textarea id="add-keys" rows="3" placeholder="gsk_aaaaaaaa...&#10;gsk_bbbbbbbb...&#10;gsk_cccccccc..." spellcheck="false"></textarea>
+              </label>
+            </div>
+            <div class="form-foot">
+              <span class="muted" id="add-hint"></span>
+              <button class="btn primary" type="submit">Add account(s)</button>
+            </div>
+          </form>
+
+          <div class="toolbar">
+            <select id="acc-filter"><option value="">All providers</option></select>
+            <input id="acc-search" placeholder="Search name, key or ID…" spellcheck="false">
+            <span class="spacer"></span>
+            <button class="btn ghost" id="bulk-check">Check all</button>
+            <button class="btn ghost" id="reset-cooldowns">Clear cooldowns</button>
+          </div>
+
+          <section class="panel">
+            <div class="table-wrap">
+              <table class="table accounts">
+                <thead>
+                  <tr><th>Account</th><th>Provider</th><th>Key</th><th>Status</th><th class="num">Reqs</th><th class="num">Tokens</th><th>Last used</th><th class="actions-col">Actions</th></tr>
+                </thead>
+                <tbody id="accounts-body"></tbody>
+              </table>
+            </div>
+            <div class="empty" id="accounts-empty" hidden>
+              <span class="empty-ico" data-icon="key"></span>
+              <h3>No accounts yet</h3>
+              <p class="muted">Add your Groq keys above. Every key you add multiplies the free quota behind the same API.</p>
+            </div>
+          </section>
+        </section>
+
+        <!-- ------------------------------------------------ providers -->
+        <section class="tab" data-tab="providers" hidden>
+          <p class="lead muted">Every provider you add here lives behind the same endpoint. Free-tier numbers are approximate and change often.</p>
+          <div class="provider-grid" id="provider-grid"></div>
+        </section>
+
+        <!-- ----------------------------------------------- playground -->
+        <section class="tab" data-tab="playground" hidden>
+          <div class="playground">
+            <section class="panel chat-panel">
+              <header class="panel-head">
+                <h2>Chat</h2>
+                <button class="btn ghost tiny" id="pg-clear">Clear</button>
+              </header>
+              <div class="chat" id="pg-chat">
+                <div class="chat-empty">
+                  <span class="ico big" data-icon="play"></span>
+                  <h3>Send a request through your gateway</h3>
+                  <p class="muted">It picks the healthiest account automatically. Watch which provider answered below the reply.</p>
+                </div>
+              </div>
+              <form class="composer" id="pg-form">
+                <textarea id="pg-input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+                <button class="btn primary" type="submit" id="pg-send">Send</button>
+              </form>
+            </section>
+            <aside class="panel pg-side">
+              <h2>Request</h2>
+              <label class="field"><span>Model</span><select id="pg-model"></select></label>
+              <label class="field"><span>Provider</span><select id="pg-provider"><option value="">Auto — best account</option></select></label>
+              <label class="switch-row"><span>Stream response</span><input type="checkbox" id="pg-stream" checked></label>
+              <label class="field"><span>Max tokens</span><input id="pg-max" type="number" min="1" max="32000" value="512"></label>
+              <div class="pg-last" id="pg-last">No requests yet.</div>
+            </aside>
+          </div>
+        </section>
+
+        <!-- --------------------------------------------------- models -->
+        <section class="tab" data-tab="models" hidden>
+          <div class="toolbar">
+            <p class="lead muted">Live model list pulled from each provider account.</p>
+            <span class="spacer"></span>
+            <button class="btn ghost" id="models-refresh">Refresh live</button>
+          </div>
+          <div id="model-groups" class="model-groups"></div>
+        </section>
+
+        <!-- ----------------------------------------------------- logs -->
+        <section class="tab" data-tab="logs" hidden>
+          <div class="toolbar">
+            <select id="log-provider"><option value="">All providers</option></select>
+            <select id="log-limit">
+              <option value="50">Last 50</option>
+              <option value="100" selected>Last 100</option>
+              <option value="300">Last 300</option>
+              <option value="1000">Last 1000</option>
+            </select>
+            <label class="switch-row compact"><span>Errors only</span><input type="checkbox" id="log-errors"></label>
+            <span class="spacer"></span>
+            <button class="btn ghost" id="logs-refresh">Refresh</button>
+            <button class="btn ghost danger" id="logs-clear">Clear log</button>
+          </div>
+          <section class="panel">
+            <div class="table-wrap">
+              <table class="table logs">
+                <thead>
+                  <tr><th>Time</th><th>Provider</th><th>Account</th><th>Model</th><th>Status</th><th class="num">ms</th><th class="num">Tokens</th><th>Prompt / error</th></tr>
+                </thead>
+                <tbody id="logs-body"></tbody>
+              </table>
+            </div>
+            <div class="empty" id="logs-empty" hidden>
+              <span class="empty-ico" data-icon="list"></span>
+              <h3>No requests logged</h3>
+              <p class="muted">Send something from the Playground or call <code>/v1/chat/completions</code>.</p>
+            </div>
+          </section>
+        </section>
+
+        <!-- ------------------------------------------------- settings -->
+        <section class="tab" data-tab="settings" hidden>
+          <div class="grid-2">
+            <section class="panel">
+              <header class="panel-head"><h2>Connection</h2><span class="chip ok">ready</span></header>
+              <div class="kv-list">
+                <div class="kv-row"><span>API base URL</span><code id="set-base">—</code><button class="btn tiny" data-copy="endpoint">Copy</button></div>
+                <div class="kv-row"><span>Client API key</span><code id="set-clientkey">—</code><button class="btn tiny" data-copy="clientkey">Copy</button></div>
+                <div class="kv-row"><span>Admin token</span><code id="set-admin">—</code><button class="btn tiny" data-copy="admin">Copy</button></div>
+              </div>
+              <div class="form-foot">
+                <span class="muted">Rotating the client key breaks every app still using the old one.</span>
+                <button class="btn ghost danger" id="rotate-key">Rotate client key</button>
+              </div>
+            </section>
+
+            <section class="panel">
+              <header class="panel-head"><h2>Routing</h2><span class="muted">how accounts get picked</span></header>
+              <div class="form-grid two">
+                <label class="field"><span>Mode</span>
+                  <select id="set-mode">
+                    <option value="random">random — spread across all accounts (recommended)</option>
+                    <option value="sticky">sticky — reuse a warm account</option>
+                  </select>
+                </label>
+                <label class="field"><span>Max retries per request</span><input id="set-retries" type="number" min="1" max="6"></label>
+                <label class="field"><span>Cooldown after a failure (s)</span><input id="set-cooldown" type="number" min="5" max="86400"></label>
+                <label class="field"><span>Upstream timeout (s)</span><input id="set-timeout" type="number" min="10" max="900"></label>
+                <label class="field wide"><span>Force model <em>optional — overrides what clients ask for</em></span><input id="set-force" placeholder="e.g. llama-3.3-70b-versatile" spellcheck="false"></label>
+              </div>
+              <div class="form-foot">
+                <span class="muted" id="routing-saved"></span>
+                <button class="btn primary" id="save-routing">Save routing</button>
+              </div>
+            </section>
+          </div>
+
+          <div class="grid-2">
+            <section class="panel">
+              <header class="panel-head"><h2>Server</h2><span class="muted" id="set-version">—</span></header>
+              <dl class="kv" id="set-server"></dl>
+              <div class="form-grid two">
+                <label class="field"><span>Port <em>restart required</em></span><input id="set-port" type="number" min="1" max="65535"></label>
+                <label class="field"><span>Request log limit</span><input id="set-maxlogs" type="number" min="100" max="20000"></label>
+              </div>
+              <label class="switch-row"><span>Keep request log</span><input type="checkbox" id="set-logging"></label>
+              <div class="form-foot">
+                <span class="muted" id="server-saved"></span>
+                <button class="btn primary" id="save-server">Save</button>
+              </div>
+            </section>
+
+            <section class="panel">
+              <header class="panel-head"><h2>Backup</h2><span class="muted">move your setup between VPS</span></header>
+              <p class="muted">Export contains your API keys — store it somewhere safe.</p>
+              <div class="stack">
+                <button class="btn ghost" id="export-config">Export config (JSON)</button>
+                <label class="btn ghost file-btn">Import config<input type="file" id="import-file" accept="application/json" hidden></label>
+                <button class="btn ghost danger" id="clear-requests">Clear request log</button>
+              </div>
+              <div class="form-foot">
+                <span class="muted">Data dir: <code id="set-datadir">—</code></span>
+              </div>
+            </section>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <div class="modal-root" id="modal-root" hidden>
+    <div class="modal-backdrop" data-modal-close></div>
+    <div class="modal" role="dialog" aria-modal="true">
+      <h2 id="modal-title">Title</h2>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
